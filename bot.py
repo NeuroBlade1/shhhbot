@@ -722,16 +722,39 @@ def main():
             
             if SERVER_MODE:
                 # در حالت سرور، تسک ذخیره خودکار آمار را راه‌اندازی می‌کنیم
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
                 async def start_polling_with_auto_save():
                     global save_task
                     # تسک ذخیره خودکار را راه‌اندازی می‌کنیم
                     save_task = asyncio.create_task(auto_save_stats())
                     
                     # شروع پولینگ
-                    await application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, timeout=10)
+                    await application.initialize()
+                    await application.start()
+                    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, timeout=10)
+                    
+                    # منتظر ماندن برای سیگنال توقف
+                    stop_signal = asyncio.Future()
+                    
+                    # تعریف تابع برای توقف
+                    def stop_callback():
+                        stop_signal.set_result(None)
+                    
+                    # منتظر ماندن برای سیگنال توقف
+                    await stop_signal
+                    
+                    # توقف و آزادسازی منابع
+                    await application.updater.stop()
+                    await application.stop()
+                    await application.shutdown()
                 
-                # اجرای پولینگ همراه با ذخیره خودکار آمار
-                asyncio.run(start_polling_with_auto_save())
+                # اجرای تابع با حلقه رویداد جدید
+                try:
+                    loop.run_until_complete(start_polling_with_auto_save())
+                finally:
+                    loop.close()
             else:
                 # در حالت عادی، فقط پولینگ را اجرا می‌کنیم
                 application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, timeout=10)
