@@ -1555,14 +1555,17 @@ async def post_startup():
             logger.error(f"خطا در ارسال پیام راه‌اندازی مجدد: {str(e)}")
 
 async def run_bot():
-    """راه‌اندازی ربات با قابلیت اتصال مجدد خودکار"""
+    """راه‌اندازی ربات"""
     logger.info("در حال راه‌اندازی ربات...")
     
-    # راه‌اندازی ربات با استفاده از ConnectionManager
-    await connection_manager.start_polling(
-        setup_handlers_func=setup_handlers,
-        post_startup_func=post_startup
-    )
+    # راه‌اندازی ساده ربات
+    try:
+        await connection_manager.start_polling(
+            setup_handlers_func=setup_handlers,
+            post_startup_func=post_startup
+        )
+    except Exception as e:
+        logger.error(f"خطا در راه‌اندازی ربات: {str(e)}")
 
 if __name__ == '__main__':
     main()
