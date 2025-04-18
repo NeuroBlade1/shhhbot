@@ -269,6 +269,29 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
                 compress_json=False
             )
             
+            # Add Instagram login to prevent 401 errors
+            try:
+                # Replace with your Instagram credentials
+                INSTAGRAM_USERNAME = "your_instagram_username"
+                INSTAGRAM_PASSWORD = "your_instagram_password"
+                
+                if INSTAGRAM_USERNAME != "your_instagram_username" and INSTAGRAM_PASSWORD != "your_instagram_password":
+                    L.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+                    await status_message.edit_text(
+                        "🔍 در حال پردازش لینک...\n\n"
+                        "⏳ مراحل دانلود:\n"
+                        "✅ بررسی لینک\n"
+                        "✅ ورود به حساب اینستاگرام\n"
+                        "◾️ دریافت اطلاعات پست...\n"
+                        "◾️ دانلود ویدیو...\n"
+                        "◾️ ارسال به تلگرام...\n\n"
+                        "⏳ لطفاً کمی صبر کنید..."
+                    )
+            except Exception as login_error:
+                print(f"Instagram login error: {str(login_error)}")
+                # Continue without login
+                pass
+            
             await status_message.edit_text(
                 "🔍 در حال پردازش لینک...\n\n"
                 "⏳ مراحل دانلود:\n"
