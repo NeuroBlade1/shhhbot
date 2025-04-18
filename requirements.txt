@@ -1,4 +1,4 @@
-python-telegram-bot==20.8
+python-telegram-bot==20.3
 instaloader==4.10.2
 persiantools==3.0.1
 pytz==2024.1
