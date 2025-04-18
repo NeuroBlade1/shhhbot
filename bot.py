@@ -1,20 +1,17 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import sqlite3
-from instaloader import Instaloader, Post
-from urllib.parse import urlparse
 import tempfile
 from pathlib import Path
 import asyncio
 import uuid
 from persiantools.jdatetime import JalaliDateTime
 import pytz
-import requests
 import os
 import logging
-import time
 from datetime import datetime
 import sys
+import yt_dlp
 
 # ماژول‌های سفارشی برای مدیریت سرور و اتصال
 from server_utils import ServerMonitor
@@ -256,41 +253,14 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
                 "⏳ لطفاً کمی صبر کنید..."
             )
             
-            url_path = urlparse(message).path
-            shortcode = url_path.split('/')[-2] if url_path.split('/')[-1] == '' else url_path.split('/')[-1]
-            
-            L = Instaloader(
-                dirname_pattern=temp_dir,
-                download_videos=True,
-                download_video_thumbnails=False,
-                download_geotags=False,
-                download_comments=False,
-                save_metadata=False,
-                compress_json=False
-            )
-            
-            # Add Instagram login to prevent 401 errors
-            try:
-                # Replace with your Instagram credentials
-                INSTAGRAM_USERNAME = "your_instagram_username"
-                INSTAGRAM_PASSWORD = "your_instagram_password"
-                
-                if INSTAGRAM_USERNAME != "your_instagram_username" and INSTAGRAM_PASSWORD != "your_instagram_password":
-                    L.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-                    await status_message.edit_text(
-                        "🔍 در حال پردازش لینک...\n\n"
-                        "⏳ مراحل دانلود:\n"
-                        "✅ بررسی لینک\n"
-                        "✅ ورود به حساب اینستاگرام\n"
-                        "◾️ دریافت اطلاعات پست...\n"
-                        "◾️ دانلود ویدیو...\n"
-                        "◾️ ارسال به تلگرام...\n\n"
-                        "⏳ لطفاً کمی صبر کنید..."
-                    )
-            except Exception as login_error:
-                print(f"Instagram login error: {str(login_error)}")
-                # Continue without login
-                pass
+            # تنظیمات yt-dlp
+            ydl_opts = {
+                'format': 'best[ext=mp4]/best',
+                'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+                'quiet': True,
+                'no_warnings': True,
+                'ignoreerrors': False,
+            }
             
             await status_message.edit_text(
                 "🔍 در حال پردازش لینک...\n\n"
@@ -302,9 +272,15 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
                 "⏳ لطفاً کمی صبر کنید..."
             )
             
-            post = Post.from_shortcode(L.context, shortcode)
-            
-            if post.is_video:
+            # دانلود ویدیو با yt-dlp
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(message, download=True)
+                if not info:
+                    raise Exception("محتوای مورد نظر یافت نشد")
+                
+                # بررسی نوع فایل دانلود شده
+                is_video = info.get('is_video', False) or info.get('ext') == 'mp4'
+                
                 await status_message.edit_text(
                     "🔍 در حال پردازش لینک...\n\n"
                     "⏳ مراحل دانلود:\n"
@@ -315,38 +291,40 @@ async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TY
                     "⏳ لطفاً کمی صبر کنید..."
                 )
                 
-                L.download_post(post, target=temp_dir)
-                
-                video_files = list(Path(temp_dir).glob('*.mp4'))
-                
-                if video_files:
-                    video_path = str(video_files[0])
-                    try:
-                        await status_message.edit_text(
-                            "🔍 در حال پردازش لینک...\n\n"
-                            "⏳ مراحل دانلود:\n"
-                            "✅ بررسی لینک\n"
-                            "✅ دریافت اطلاعات پست\n"
-                            "✅ دانلود ویدیو\n"
-                            "✅ ارسال به تلگرام...\n\n"
-                            "⏳ لطفاً کمی صبر کنید..."
-                        )
-                        
-                        await update.message.reply_video(
-                            video=video_path,
-                            caption="🎥 ویدیو شما با موفقیت دانلود شد!"
-                        )
-                    except Exception as e:
-                        print(f"Error sending video: {str(e)}")
+                # یافتن فایل دانلود شده
+                if '_filename' in info:
+                    # فایل مستقیما از اطلاعات استخراج می‌شود
+                    file_path = info['_filename']
                 else:
-                    raise Exception("فایل ویدیو پیدا نشد")
-            else:
+                    # جستجوی فایل در دایرکتوری موقت
+                    downloaded_files = list(Path(temp_dir).glob('*'))
+                    if not downloaded_files:
+                        raise Exception("فایل دانلود شده یافت نشد")
+                    file_path = str(downloaded_files[0])
+                
                 await status_message.edit_text(
-                    "❌ این پست ویدیو نیست.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]]),
-                    parse_mode='Markdown'
+                    "🔍 در حال پردازش لینک...\n\n"
+                    "⏳ مراحل دانلود:\n"
+                    "✅ بررسی لینک\n"
+                    "✅ دریافت اطلاعات پست\n"
+                    "✅ دانلود ویدیو\n"
+                    "✅ ارسال به تلگرام...\n\n"
+                    "⏳ لطفاً کمی صبر کنید..."
                 )
                 
+                # ارسال فایل به کاربر
+                if is_video:
+                    await update.message.reply_video(
+                        video=open(file_path, 'rb'),
+                        caption="🎥 ویدیو با موفقیت دانلود شد!"
+                    )
+                else:
+                    # اگر محتوا ویدیو نبود (مثلاً عکس)
+                    await update.message.reply_photo(
+                        photo=open(file_path, 'rb'),
+                        caption="📸 تصویر با موفقیت دانلود شد!"
+                    )
+                    
         except Exception as e:
             print(f"Error downloading video: {str(e)}")
             keyboard = []
@@ -398,140 +376,121 @@ async def handle_instagram_story(update: Update, context: ContextTypes.DEFAULT_T
         "⏳ لطفاً کمی صبر کنید..."
     )
     
-    try:
-        await status_message.edit_text(
-            "🔍 در حال پردازش لینک استوری...\n\n"
-            "⏳ مراحل دانلود:\n"
-            "✅ بررسی لینک\n"
-            "◾️ دریافت اطلاعات استوری...\n"
-            "◾️ دانلود...\n"
-            "◾️ ارسال به تلگرام...\n\n"
-            "⏳ لطفاً کمی صبر کنید..."
-        )
-
-        # Extract username from the story link
-        username = message.split("instagram.com/stories/")[-1].split("/")[0]
-
-        url = "https://instagram-premium-api-2023.p.rapidapi.com/v1/user/stories/by/username"
-        querystring = {"username": username, "amount": "0"}
-        headers = {
-            "x-rapidapi-key": "ec164931cfmsh029a8d32327b1f5p13c235jsn7e9175855053",  # کلید API خود را اینجا قرار دهید
-            "x-rapidapi-host": "instagram-premium-api-2023.p.rapidapi.com"
-        }
-        response = requests.get(url, headers=headers, params=querystring)
-        response_json = response.json()
-        print(response_json)
-
-        if response.status_code != 200:
-            await status_message.edit_text(f"❌ خطایی رخ داد: {response_json.get('message', 'خطای ناشناخته')}")
-            return
-
-        await status_message.edit_text(
-            "🔍 در حال پردازش لینک استوری...\n\n"
-            "⏳ مراحل دانلود:\n"
-            "✅ بررسی لینک\n"
-            "✅ دریافت اطلاعات استوری\n"
-            "◾️ دانلود...\n"
-            "◾️ ارسال به تلگرام...\n\n"
-            "⏳ لطفاً کمی صبر کنید..."
-        )
-
-        # Process each story item
-        if response_json and isinstance(response_json, list):
-            for story in response_json:
-                media_type = story.get('media_type')
-                if media_type == 2:  # Video
-                    media_url = story.get('video_url')
-                elif media_type == 1:  # Image
-                    media_url = story.get('thumbnail_url')
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            await status_message.edit_text(
+                "🔍 در حال پردازش لینک استوری...\n\n"
+                "⏳ مراحل دانلود:\n"
+                "✅ بررسی لینک\n"
+                "◾️ دریافت اطلاعات استوری...\n"
+                "◾️ دانلود...\n"
+                "◾️ ارسال به تلگرام...\n\n"
+                "⏳ لطفاً کمی صبر کنید..."
+            )
+            
+            # تنظیمات yt-dlp برای استوری
+            ydl_opts = {
+                'format': 'best[ext=mp4]/best',
+                'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+                'quiet': True,
+                'no_warnings': True,
+                'ignoreerrors': False,
+            }
+            
+            await status_message.edit_text(
+                "🔍 در حال پردازش لینک استوری...\n\n"
+                "⏳ مراحل دانلود:\n"
+                "✅ بررسی لینک\n"
+                "✅ دریافت اطلاعات استوری\n"
+                "◾️ دانلود...\n"
+                "◾️ ارسال به تلگرام...\n\n"
+                "⏳ لطفاً کمی صبر کنید..."
+            )
+            
+            # دانلود استوری با yt-dlp
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(message, download=True)
+                if not info:
+                    raise Exception("استوری مورد نظر یافت نشد")
+                
+                # بررسی نوع فایل دانلود شده
+                is_video = info.get('is_video', False) or info.get('ext') == 'mp4'
+                
+                await status_message.edit_text(
+                    "🔍 در حال پردازش لینک استوری...\n\n"
+                    "⏳ مراحل دانلود:\n"
+                    "✅ بررسی لینک\n"
+                    "✅ دریافت اطلاعات استوری\n"
+                    "✅ دانلود\n"
+                    "◾️ ارسال به تلگرام...\n\n"
+                    "⏳ لطفاً کمی صبر کنید..."
+                )
+                
+                # یافتن فایل دانلود شده
+                if '_filename' in info:
+                    # فایل مستقیما از اطلاعات استخراج می‌شود
+                    file_path = info['_filename']
                 else:
-                    continue
+                    # جستجوی فایل در دایرکتوری موقت
+                    downloaded_files = list(Path(temp_dir).glob('*'))
+                    if not downloaded_files:
+                        raise Exception("فایل دانلود شده یافت نشد")
+                    file_path = str(downloaded_files[0])
+                
+                await status_message.edit_text(
+                    "🔍 در حال پردازش لینک استوری...\n\n"
+                    "⏳ مراحل دانلود:\n"
+                    "✅ بررسی لینک\n"
+                    "✅ دریافت اطلاعات استوری\n"
+                    "✅ دانلود\n"
+                    "✅ ارسال به تلگرام...\n\n"
+                    "⏳ لطفاً کمی صبر کنید..."
+                )
+                
+                # ارسال فایل به کاربر
+                if is_video:
+                    await update.message.reply_video(
+                        video=open(file_path, 'rb'),
+                        caption="🎥 استوری با موفقیت دانلود شد!"
+                    )
+                else:
+                    # اگر محتوا ویدیو نبود (مثلاً عکس)
+                    await update.message.reply_photo(
+                        photo=open(file_path, 'rb'),
+                        caption="📸 استوری با موفقیت دانلود شد!"
+                    )
+                    
+                # حذف پیام وضعیت و نمایش پیام موفقیت
+                await status_message.delete()
+                
+                keyboard = []
+                if is_admin(user.id):
+                    keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
+                
+                await update.message.reply_text(
+                    "✅ عملیات با موفقیت انجام شد!",
+                    reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+                )
 
-                if not media_url:
-                    continue
-
-                # تغییر روش دانلود فایل
-                temp_path = None
-                try:
-                    with tempfile.NamedTemporaryFile(suffix='.mp4' if media_type == 2 else '.jpg', delete=False) as temp_file:
-                        temp_path = temp_file.name
-                        session = requests.Session()
-                        retries = 3
-                        while retries > 0:
-                            try:
-                                response = session.get(media_url, stream=True, timeout=30)
-                                response.raise_for_status()
-                                total_size = int(response.headers.get('content-length', 0))
-                                block_size = 1024 * 1024
-                                with open(temp_path, 'wb') as file:
-                                    for data in response.iter_content(block_size):
-                                        file.write(data)
-                                break
-                            except (requests.exceptions.RequestException, IOError) as e:
-                                retries -= 1
-                                if retries == 0:
-                                    raise e
-                                await asyncio.sleep(1)
-
-                    if media_type == 2:  # ویدیو
-                        await update.message.reply_video(
-                            video=open(temp_path, 'rb'),
-                            caption="🎥 استوری دانلود شد!"
-                        )
-                    else:  # عکس
-                        await update.message.reply_photo(
-                            photo=open(temp_path, 'rb'),
-                            caption="📸 استوری دانلود شد!"
-                        )
-
-                finally:
-                    if temp_path:
-                        try:
-                            os.unlink(temp_path)
-                        except:
-                            pass
-
-            # فقط در انتها یک بار پیام موفقیت نمایش داده شود
+        except Exception as e:
+            print(f"Error downloading story: {str(e)}")
             keyboard = []
             if is_admin(user.id):
                 keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
             
-            await status_message.delete()  # حذف پیام وضعیت قبلی
+            error_message = (
+                "❌ خطا در دانلود استوری.\n"
+                "دلایل احتمالی:\n"
+                "• استوری خصوصی است\n"
+                "• استوری حذف شده است\n"
+                "• لینک نامعتبر است\n\n"
+                "لطفاً دوباره تلاش کنید یا لینک دیگری ارسال کنید."
+            )
+            await status_message.delete()
             await update.message.reply_text(
-                "✅ عملیات با موفقیت انجام شد!",
+                error_message,
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
             )
-
-        else:
-            keyboard = []
-            if is_admin(user.id):
-                keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
-            
-            await status_message.delete()  # حذف پیام وضعیت قبلی
-            await update.message.reply_text(
-                "❌ استوری‌ای برای دانلود پیدا نشد.",
-                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
-            )
-
-    except Exception as e:
-        print(f"Error downloading story: {str(e)}")
-        keyboard = []
-        if is_admin(user.id):
-            keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
-        
-        error_message = (
-            "❌ خطا در دانلود استوری.\n"
-            "دلایل احتمالی:\n"
-            "• استوری خصوصی است\n"
-            "• استوری حذف شده است\n"
-            "• لینک نامعتبر است\n\n"
-            "لطفاً دوباره تلاش کنید یا لینک دیگری ارسال کنید."
-        )
-        await status_message.delete()  # حذف پیام وضعیت قبلی
-        await update.message.reply_text(
-            error_message,
-            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
-        )
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
