@@ -79,20 +79,19 @@ class ConnectionManager:
                 self.connection_status["last_connected"] = time.time()
                 self.reconnect_attempts = 0
                 
-                # استفاده از الگوی async with برای مدیریت چرخه حیات Application
-                # این روش برای نسخه‌های جدید python-telegram-bot توصیه شده است
-                async with self.application:
-                    # اگر تابع پس از راه‌اندازی وجود دارد، اجرا می‌کنیم
-                    if post_startup_func:
-                        await post_startup_func()
-                    
-                    logger.info("ربات با موفقیت راه‌اندازی شد!")
-                    
-                    # شروع polling با استفاده از حالت پیش‌فرض
-                    await self.application.start_polling(drop_pending_updates=True)
-                    
-                    # منتظر می‌مانیم تا Application متوقف شود
-                    await self.application.idle()
+                # اجرای تابع پس از راه‌اندازی (قبل از شروع polling)
+                if post_startup_func:
+                    await post_startup_func()
+                
+                logger.info("ربات با موفقیت راه‌اندازی شد!")
+                
+                # استفاده از روش run_polling که در نسخه‌های جدید python-telegram-bot پشتیبانی می‌شود
+                # تنظیم close_loop=False برای حفظ کنترل بر حلقه رویداد
+                await self.application.run_polling(
+                    drop_pending_updates=True,
+                    close_loop=False,
+                    stop_signals=None  # غیرفعال کردن توقف خودکار با سیگنال‌ها
+                )
                 
                 # اگر به اینجا برسیم یعنی برنامه به طور عادی متوقف شده است
                 # از حلقه خارج می‌شویم
