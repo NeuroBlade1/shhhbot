@@ -74,24 +74,27 @@ class ConnectionManager:
                 
                 logger.info("ربات در حال راه‌اندازی...")
                 
-                await self.application.initialize()
-                await self.application.start()
-                
                 # به‌روزرسانی وضعیت اتصال
                 self.connection_status["is_connected"] = True
                 self.connection_status["last_connected"] = time.time()
                 self.reconnect_attempts = 0
+                
+                # شروع polling - در نسخه‌های جدید python-telegram-bot
+                # روش راه‌اندازی فرق کرده است
+                await self.application.initialize()
+                await self.application.start()
+                await self.application.update_queue.put_nowait(object())  # برای اطمینان از باز شدن کانال ارتباطی
                 
                 if post_startup_func:
                     await post_startup_func()
                 
                 logger.info("ربات با موفقیت راه‌اندازی شد!")
                 
-                # منتظر ماندن تا زمانی که برنامه در حال اجراست
-                await self.application.updater.start_polling()
-                await self.application.updater.idle()
+                # در نسخه‌های جدید به جای استفاده از updater
+                # باید از خود application استفاده کنیم
+                await self.application.run_polling(drop_pending_updates=True)
                 
-                break  # اگر idle به پایان برسد، از حلقه خارج می‌شویم
+                break  # اگر polling به پایان برسد، از حلقه خارج می‌شویم
                 
             except telegram.error.NetworkError as e:
                 await self.handle_connection_error(e, "خطای شبکه")
