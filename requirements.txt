@@ -3,3 +3,4 @@ persiantools
 pytz
 requests
 yt-dlp 
+psutil 
