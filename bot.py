@@ -493,7 +493,7 @@ async def handle_instagram_story(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         print(f"Error downloading story: {str(e)}")
         keyboard = []
-        if is_admin(user_id):
+        if is_admin(user.id):
             keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
         
         error_message = (
@@ -1303,7 +1303,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     current_page = 1
                 
                 # بازگشت به همان صفحه
-                await query.data_callback(f"users_page_{current_page}", update, context)
+                new_query = query
+                new_query.data = f"users_page_{current_page}"
+                update.callback_query = new_query
+                await button_callback(update, context)
                 
             else:
                 await query.answer("❌ کاربر مورد نظر یافت نشد!", show_alert=True)
@@ -1358,8 +1361,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=None
         )
         
-        # ارسال مجدد وضعیت
-        await query.data_callback("server_status", update, context)
+        # خودمان مستقیماً تابع برای نمایش وضعیت سرور را فراخوانی می‌کنیم
+        new_query = query
+        new_query.data = "server_status"
+        update.callback_query = new_query
+        await button_callback(update, context)
     
     elif query.data == "restart_bot" and is_admin(user_id):
         restart_message = await query.edit_message_text(
