@@ -1,792 +1,1568 @@
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import sqlite3
+from instaloader import Instaloader, Post
+from urllib.parse import urlparse
+import tempfile
+from pathlib import Path
+import asyncio
+import uuid
+from persiantools.jdatetime import JalaliDateTime
+import pytz
+import requests
+import os
 import logging
 import time
-import json
-import os
-import signal
-import sys
-import psutil
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-import random
-import asyncio
-import traceback
+import sys
 
-from telegram import Update, ChatMember, ChatMemberUpdated
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    ChatMemberHandler,
-)
-# تنظیمات اولیه
-TOKEN = "8137921644:AAHVo6ESEXc4c5l7f9X7bPgb2-fBHMh2rPs"  # توکن ربات خود را اینجا قرار دهید
-CHANNEL_ID = "@Shhhiiiiiiiiiiiii"  # آیدی کانال خود را اینجا قرار دهید
-ADMIN_ID = 6629718606  # آیدی عددی ادمین را اینجا قرار دهید
-STATS_FILE = "channel_stats.json"  # فایل ذخیره آمار
-LOG_FILE = "bot.log"  # مسیر فایل لاگ
-ERROR_LOG_FILE = "error.log"  # مسیر فایل لاگ خطاها
-AUTO_SAVE_INTERVAL = 300  # ذخیره خودکار آمار هر 5 دقیقه (300 ثانیه)
-SERVER_MODE = True  # فعال‌سازی حالت سرور
-MAX_RECONNECT_DELAY = 120  # حداکثر تاخیر بین تلاش‌های اتصال مجدد (ثانیه)
+# ماژول‌های سفارشی برای مدیریت سرور و اتصال
+from server_utils import ServerMonitor
+from connection_manager import ConnectionManager
 
-# تنظیمات لاگ
-if not os.path.exists('logs'):
-    os.makedirs('logs')
-
-# تنظیم ساختار لاگینگ پیشرفته
+# راه‌اندازی لاگر
 logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join('logs', LOG_FILE), encoding='utf-8'),
-        logging.StreamHandler()
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler(sys.stdout)
     ]
 )
-
-# لاگر برای خطاها
-error_logger = logging.getLogger('error_logger')
-error_handler = logging.FileHandler(os.path.join('logs', ERROR_LOG_FILE), encoding='utf-8')
-error_handler.setLevel(logging.ERROR)
-error_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-error_handler.setFormatter(error_formatter)
-error_logger.addHandler(error_handler)
-
 logger = logging.getLogger(__name__)
 
-# متغیرهای کنترل ربات
-is_running = True
-save_task = None
-
-# ذخیره داده‌های آماری کانال
-channel_stats = {
-    "subscribers": [],  # لیست اعضای کانال
-    "visitors": [],     # لیست بازدیدکنندگان (کسانی که فقط بازدید کرده‌اند)
-    "total_views": 0,   # تعداد کل بازدیدها
-    "new_members": [],  # لیست اعضای جدید
-    "member_count": 0,  # تعداد واقعی اعضا
-    "last_updated": "",  # آخرین بروزرسانی
-    "bot_start_time": "",  # زمان آخرین راه‌اندازی ربات
-    "uptime": 0,  # مدت زمان آنلاین بودن ربات (ثانیه)
-    "restart_count": 0  # تعداد دفعات راه‌اندازی مجدد
+TOKEN = "7869277763:AAHMU_8AvyZ7FIuR5O7I7CCjdz46-PYjZ6s" #آیدی ربات خودتون رو جایگزین 123456789 کنید
+ADMIN_IDS = {
+    6629718606,  # آیدی عددی خودتون رو جایگزین 123456789 کنید
+    123456789,   # اگر میخواید ادمین دیگه ای اضافه کنید آیدی عددیش رو جایگزین 123456789 کنید وگرنه تغییر ندید
+    123456789,   # اگر میخواید ادمین دیگه ای اضافه کنید آیدی عددیش رو جایگزین 123456789 کنید وگرنه تغییر ندید
 }
+REQUIRED_CHANNELS = []
 
-def log_error(e, context=""):
-    """ثبت خطا با جزئیات بیشتر در فایل لاگ خطاها"""
-    error_logger.error(f"{context} - خطا: {str(e)}")
-    error_logger.error(traceback.format_exc())
-    logger.error(f"{context} - خطا: {str(e)}")
+# ایجاد نمونه از مانیتور سرور
+server_monitor = ServerMonitor()
 
-def load_stats():
-    """بارگیری آمار ذخیره شده"""
-    global channel_stats
-    if os.path.exists(STATS_FILE):
-        try:
-            with open(STATS_FILE, 'r', encoding='utf-8') as f:
-                loaded_stats = json.load(f)
-                # اطمینان از وجود همه کلیدها در آمار بارگیری شده
-                for key in channel_stats.keys():
-                    if key not in loaded_stats:
-                        loaded_stats[key] = channel_stats[key]
-                channel_stats = loaded_stats
-            
-            # افزایش شمارنده راه‌اندازی مجدد
-            channel_stats["restart_count"] += 1
-            # ثبت زمان راه‌اندازی
-            channel_stats["bot_start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            logger.info("آمار کانال با موفقیت بارگیری شد")
-        except Exception as e:
-            log_error(e, "خطا در بارگیری آمار کانال")
-    else:
-        # ثبت زمان راه‌اندازی اولیه
-        channel_stats["bot_start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        channel_stats["restart_count"] = 1
-        save_stats()
-        logger.info("فایل آمار کانال ایجاد شد")
+# ایجاد نمونه از مدیریت اتصال
+connection_manager = ConnectionManager(TOKEN, "bot_persistence.pickle")
 
-def save_stats():
-    """ذخیره آمار کانال در فایل"""
-    channel_stats["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # محاسبه مدت زمان آنلاین بودن
-    start_time = datetime.strptime(channel_stats["bot_start_time"], "%Y-%m-%d %H:%M:%S")
-    uptime_seconds = (datetime.now() - start_time).total_seconds()
-    channel_stats["uptime"] = uptime_seconds
+ADMIN_COMMANDS = """
+دستورات ادمین:
+/admin - نمایش پنل ادمین
+/add_channel - افزودن کانال جدید
+/del_channel - حذف کانال
+/channels - مشاهده لیست کانال‌ها
+/stats - آمار ربات
+/status - وضعیت سرور و ربات
+/restart - راه‌اندازی مجدد ربات
+"""
+
+def setup_database():
+    conn = sqlite3.connect('bot_database.db')
+    c = conn.cursor()
     
+    # اضافه کردن ستون is_banned اگر وجود نداشته باشد
     try:
-        # ایجاد نسخه پشتیبان از فایل قبلی
-        if os.path.exists(STATS_FILE):
-            backup_file = f"{STATS_FILE}.bak"
-            try:
-                with open(STATS_FILE, 'r', encoding='utf-8') as src:
-                    with open(backup_file, 'w', encoding='utf-8') as dst:
-                        dst.write(src.read())
-            except Exception as e:
-                log_error(e, "خطا در ایجاد نسخه پشتیبان از آمار کانال")
+        c.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+        conn.commit()
+    except sqlite3.OperationalError:
+        # اگر ستون قبلاً وجود داشته باشد، خطا را نادیده بگیر
+        pass
         
-        # ذخیره فایل جدید
-        with open(STATS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(channel_stats, f, ensure_ascii=False, indent=4)
-        logger.info("آمار کانال با موفقیت ذخیره شد")
-    except Exception as e:
-        log_error(e, "خطا در ذخیره آمار کانال")
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (user_id INTEGER PRIMARY KEY, 
+                  username TEXT,
+                  first_name TEXT,
+                  unique_id TEXT,
+                  is_banned INTEGER DEFAULT 0,
+                  join_date TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS groups
+                 (group_id INTEGER PRIMARY KEY, group_name TEXT, added_by INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS channels
+                 (channel_id TEXT PRIMARY KEY, name TEXT, username TEXT)''')
+    conn.commit()
+    conn.close()
 
-async def auto_save_stats():
-    """تابع ذخیره خودکار آمار به صورت دوره‌ای"""
-    while is_running:
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(user_id):
+        return []
+        
+    conn = sqlite3.connect('bot_database.db')
+    c = conn.cursor()
+    channels = c.execute("SELECT channel_id, name, username FROM channels").fetchall()
+    conn.close()
+    
+    if not channels:
+        return []
+        
+    not_subscribed_channels = []
+    for channel in channels:
         try:
-            await asyncio.sleep(AUTO_SAVE_INTERVAL)
-            save_stats()
-            logger.info(f"ذخیره خودکار آمار انجام شد (هر {AUTO_SAVE_INTERVAL} ثانیه)")
-        except asyncio.CancelledError:
-            # تسک لغو شده است
-            break
+            member = await context.bot.get_chat_member(chat_id=channel[0], user_id=user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                not_subscribed_channels.append({
+                    "id": channel[0],
+                    "name": channel[1],
+                    "username": channel[2]
+                })
         except Exception as e:
-            log_error(e, "خطا در ذخیره خودکار آمار")
-            await asyncio.sleep(10)  # در صورت خطا، کمی صبر کنید و دوباره تلاش کنید
+            print(f"Error checking {channel[2]}: {str(e)}")
+            not_subscribed_channels.append({
+                "id": channel[0],
+                "name": channel[1],
+                "username": channel[2]
+            })
+    return not_subscribed_channels
+
+def get_subscription_keyboard(channels, is_admin=False):
+    keyboard = []
+    for channel in channels:
+        keyboard.append([InlineKeyboardButton(text=channel["name"], url=f"https://t.me/{channel['username'][1:]}")])
+    keyboard.append([InlineKeyboardButton(text="بررسی عضویت ✅", callback_data="check_subscription")])
+    if is_admin:
+        keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(keyboard)
+
+async def save_user(user, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect('bot_database.db')
+    c = conn.cursor()
+    try:
+        existing_user = c.execute(
+            "SELECT unique_id FROM users WHERE user_id = ?",
+            (user.id,)
+        ).fetchone()
+        
+        if not existing_user:
+            # ساخت شناسه یکتا با uuid
+            unique_id = str(uuid.uuid4()).split('-')[0].upper()
+        else:
+            unique_id = existing_user[0]
+        
+        # تبدیل زمان به تایم‌زون ایران
+        tehran_tz = pytz.timezone('Asia/Tehran')
+        current_time = JalaliDateTime.now(tehran_tz).strftime("%Y/%m/%d %H:%M:%S")
+        
+        c.execute(
+            """INSERT OR REPLACE INTO users 
+               (user_id, username, first_name, unique_id, join_date) 
+               VALUES (?, ?, ?, ?, ?)""",
+            (user.id, user.username, user.first_name, unique_id, current_time)
+        )
+        conn.commit()
+        return unique_id
+        
+    except Exception as e:
+        print(f"Error saving user: {str(e)}")
+        return None
+    finally:
+        conn.close()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور /start - معرفی ربات"""
+    user = update.effective_user
+    
+    if await check_user_ban(user.id):
+        await update.message.reply_text(
+            "⛔️ شما از استفاده از ربات محروم شده‌اید!"
+        )
+        return
+    
+    unique_id = await save_user(user, context)
+    
+    not_subscribed = await check_subscription(user.id, context)
+    
+    if not_subscribed:
+        channels_text = "\n".join([f"- {channel['name']}" for channel in not_subscribed])
+        await update.message.reply_text(
+            f"برای استفاده از ربات، لطفا در کانال‌های زیر عضو شوید:\n{channels_text}",
+            reply_markup=get_subscription_keyboard(not_subscribed, is_admin(user.id))
+        )
+        return
+    
+    profile_text = (
+        f"👤 *پروفایل شما*\n\n"
+        f"🆔 شناسه یکتا: `{unique_id}`\n"
+        f"👤 نام: [{user.first_name}](tg://user?id={user.id})\n"
+        f"📝 نام کاربری: {f'@{user.username}' if user.username else 'تنظیم نشده'}\n\n"
+        "🎥 برای دانلود ویدیو، لینک پست اینستاگرام را ارسال کنید."
+    )
+    
+    keyboard = []
+    
+    if is_admin(user.id):
+        keyboard.append([InlineKeyboardButton("🎛 پنل ادمین", callback_data="admin_panel")])
+    
+    keyboard.append([
+        InlineKeyboardButton("➕ افزودن به گروه", callback_data="add_to_group"),
+        InlineKeyboardButton("➕ افزودن به کانال", callback_data="add_to_channel")
+    ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
-        "سلام! من ربات مدیریت کانال هستم. برای مشاهده لیست دستورات از /help استفاده کنید."
+        profile_text,
+        parse_mode='Markdown',
+        reply_markup=reply_markup
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور /help - نمایش راهنمای دستورات"""
-    help_text = """دستورات قابل استفاده:
-/start - شروع کار با ربات
-/help - نمایش این راهنما
-/stats - نمایش آمار کانال
-/refresh_stats - به‌روزرسانی آمار کانال
-/users - استخراج آیدی عددی و نام کاربری همه کاربران کانال
-/remove_deleted - حذف کاربران با حساب حذف شده از کانال
-/server - نمایش وضعیت سرور و ربات
-/restart - راه‌اندازی مجدد ربات (فقط ادمین)
-
-توجه: فقط ادمین کانال می‌تواند به همه دستورات دسترسی داشته باشد.
-"""
-    await update.message.reply_text(help_text)
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور /stats - نمایش آمار کانال"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("این دستور فقط برای ادمین کانال در دسترس است.")
-        return
+async def handle_instagram_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     
-    # اطمینان از اینکه آمار به‌روز است
-    if 'member_count' not in channel_stats:
-        try:
-            # دریافت تعداد اعضای کانال
-            bot = context.bot
-            chat = await bot.get_chat(CHANNEL_ID)
-            member_count = await chat.get_member_count()
-            channel_stats['member_count'] = member_count
-            save_stats()
-        except Exception as e:
-            logger.error(f"خطا در دریافت تعداد اعضای کانال: {e}")
-            member_count = len(channel_stats['subscribers'])
-    else:
-        member_count = channel_stats['member_count']
-    
-    stats_text = f"""📊 آمار کانال {CHANNEL_ID}:
-
-👥 تعداد اعضا: {member_count}
-👁️ تعداد بازدیدکنندگان: {len(channel_stats['visitors'])}
-👀 تعداد کل بازدیدها: {channel_stats['total_views']}
-🆕 اعضای جدید امروز: {len([m for m in channel_stats['new_members'] if m.get('joined_date', '').startswith(datetime.now().strftime("%Y-%m-%d"))])}
-
-🕒 آخرین به‌روزرسانی: {channel_stats['last_updated']}
-"""
-    await update.message.reply_text(stats_text)
-
-async def refresh_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور /refresh_stats - به‌روزرسانی آمار کانال"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("این دستور فقط برای ادمین کانال در دسترس است.")
-        return
-    
-    await update.message.reply_text("در حال به‌روزرسانی آمار کانال...")
-    
-    try:
-        bot = context.bot
-        chat = await bot.get_chat(CHANNEL_ID)
-        
-        # دریافت تعداد اعضا
-        member_count = await chat.get_member_count()
-        
-        # بروزرسانی آمار در ساختار داده
-        channel_stats['member_count'] = member_count
-        channel_stats['total_views'] += random.randint(5, 20)  # شبیه‌سازی افزایش بازدید
-        
-        # به‌روزرسانی آمار
-        save_stats()
-        
+    if await check_user_ban(user.id):
         await update.message.reply_text(
-            f"آمار کانال با موفقیت به‌روز شد.\n"
-            f"تعداد اعضای فعلی: {member_count}"
+            "⛔️ شما از استفاده از ربات محروم شده‌اید!"
         )
-    except Exception as e:
-        logger.error(f"خطا در به‌روزرسانی آمار کانال: {e}")
-        await update.message.reply_text(f"خطا در به‌روزرسانی آمار کانال: {str(e)}")
+        return
+    
+    not_subscribed = await check_subscription(user.id, context)
+    if not_subscribed:
+        channels_text = "\n".join([f"- {channel['name']}" for channel in not_subscribed])
+        await update.message.reply_text(
+            f"برای استفاده از ربات، لطفا در کانال‌های زیر عضو شوید:\n{channels_text}",
+            reply_markup=get_subscription_keyboard(not_subscribed, is_admin(user.id))
+        )
+        return
 
-async def track_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پیگیری تغییرات اعضای کانال"""
-    result = extract_status_change(update.chat_member)
+    message = update.message.text
     
-    if result is None:
+    if "instagram.com" not in message:
+        await update.message.reply_text("لطفاً یک لینک معتبر اینستاگرام ارسال کنید.")
         return
     
-    was_member, is_member = result
-    user = update.chat_member.new_chat_member.user
-    chat = update.chat_member.chat
-    
-    # بررسی اینکه آیا این تغییر مربوط به کانال ما است
-    if chat.username and f"@{chat.username}" != CHANNEL_ID:
+    if "instagram.com/stories/" in message:
+        await handle_instagram_story(update, context)
         return
+
+    status_message = await update.message.reply_text(
+        "🔍 در حال پردازش لینک...\n\n"
+        "⏳ مراحل دانلود:\n"
+        "◾️ بررسی لینک...\n"
+        "◾️ دریافت اطلاعات پست...\n"
+        "◾️ دانلود ویدیو...\n"
+        "◾️ ارسال به تلگرام...\n\n"
+        "⏳ لطفاً کمی صبر کنید..."
+    )
     
-    # بررسی اینکه آیا کاربر حساب حذف شده است
-    if user.is_deleted and is_member:
+    with tempfile.TemporaryDirectory() as temp_dir:
         try:
-            logger.info(f"یک حساب حذف شده (آیدی: {user.id}) در کانال شناسایی شد. در حال حذف...")
+            await status_message.edit_text(
+                "🔍 در حال پردازش لینک...\n\n"
+                "⏳ مراحل دانلود:\n"
+                "✅ بررسی لینک\n"
+                "◾️ دریافت اطلاعات پست...\n"
+                "◾️ دانلود ویدیو...\n"
+                "◾️ ارسال به تلگرام...\n\n"
+                "⏳ لطفاً کمی صبر کنید..."
+            )
             
-            # حذف کاربر از کانال
-            await context.bot.ban_chat_member(chat.id, user.id)
-            # لغو محرومیت بلافاصله (برای اینکه فقط حذف شود نه اینکه بن شود)
-            await context.bot.unban_chat_member(chat.id, user.id)
+            url_path = urlparse(message).path
+            shortcode = url_path.split('/')[-2] if url_path.split('/')[-1] == '' else url_path.split('/')[-1]
             
-            logger.info(f"حساب حذف شده با آیدی {user.id} از کانال حذف شد")
+            L = Instaloader(
+                dirname_pattern=temp_dir,
+                download_videos=True,
+                download_video_thumbnails=False,
+                download_geotags=False,
+                download_comments=False,
+                save_metadata=False,
+                compress_json=False
+            )
             
-            # به‌روزرسانی تعداد اعضا
-            try:
-                member_count = await chat.get_member_count()
-                channel_stats['member_count'] = member_count
-                save_stats()
-            except Exception as e:
-                logger.error(f"خطا در به‌روزرسانی تعداد اعضا پس از حذف حساب حذف شده: {e}")
-                
-            return  # خروج از تابع چون کاربر حذف شده است
-        except Exception as e:
-            logger.error(f"خطا در حذف حساب حذف شده: {e}")
-    
-    user_info = {
-        "id": user.id,
-        "username": user.username,
-        "first_name": user.first_name,
-        "last_name": user.last_name
-    }
-    
-    # به‌روزرسانی تعداد اعضا
-    try:
-        member_count = await chat.get_member_count()
-        channel_stats['member_count'] = member_count
-        logger.info(f"تعداد اعضای کانال به‌روز شد: {member_count}")
-    except Exception as e:
-        logger.error(f"خطا در به‌روزرسانی تعداد اعضا: {e}")
-    
-    if not was_member and is_member:
-        # کاربر جدید عضو شده است
-        logger.info(f"کاربر جدید: {user.full_name} (@{user.username}) به کانال پیوست")
-        
-        # افزودن به لیست اعضا اگر قبلاً وجود نداشته باشد
-        if user.id not in [sub.get('id') for sub in channel_stats['subscribers']]:
-            user_info["joined_date"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            channel_stats['subscribers'].append(user_info)
-            channel_stats['new_members'].append(user_info)
+            await status_message.edit_text(
+                "🔍 در حال پردازش لینک...\n\n"
+                "⏳ مراحل دانلود:\n"
+                "✅ بررسی لینک\n"
+                "✅ دریافت اطلاعات پست\n"
+                "◾️ دانلود ویدیو...\n"
+                "◾️ ارسال به تلگرام...\n\n"
+                "⏳ لطفاً کمی صبر کنید..."
+            )
             
-            # ارسال پیام خوش‌آمدگویی
-            try:
-                welcome_message = f"👋 سلام {user.mention_html()}!\n\nبه کانال {CHANNEL_ID} خوش آمدید!"
-                message = await context.bot.send_message(
-                    chat_id=chat.id,
-                    text=welcome_message,
-                    parse_mode='HTML'
+            post = Post.from_shortcode(L.context, shortcode)
+            
+            if post.is_video:
+                await status_message.edit_text(
+                    "🔍 در حال پردازش لینک...\n\n"
+                    "⏳ مراحل دانلود:\n"
+                    "✅ بررسی لینک\n"
+                    "✅ دریافت اطلاعات پست\n"
+                    "✅ دانلود ویدیو\n"
+                    "◾️ ارسال به تلگرام...\n\n"
+                    "⏳ لطفاً کمی صبر کنید..."
                 )
                 
-                # حذف پیام خوش‌آمدگویی بعد از 1 دقیقه (60 ثانیه)
-                await asyncio.sleep(60)
-                await message.delete()
-                logger.info(f"پیام خوش‌آمدگویی برای کاربر {user.full_name} حذف شد")
-            except Exception as e:
-                logger.error(f"خطا در ارسال یا حذف پیام خوش‌آمدگویی: {e}")
-        
-        save_stats()
-        
-    elif was_member and not is_member:
-        # کاربر کانال را ترک کرده است
-        logger.info(f"کاربر {user.full_name} (@{user.username}) کانال را ترک کرد")
-        
-        # حذف از لیست اعضا
-        channel_stats['subscribers'] = [sub for sub in channel_stats['subscribers'] if sub.get('id') != user.id]
-        save_stats()
+                L.download_post(post, target=temp_dir)
+                
+                video_files = list(Path(temp_dir).glob('*.mp4'))
+                
+                if video_files:
+                    video_path = str(video_files[0])
+                    try:
+                        await status_message.edit_text(
+                            "🔍 در حال پردازش لینک...\n\n"
+                            "⏳ مراحل دانلود:\n"
+                            "✅ بررسی لینک\n"
+                            "✅ دریافت اطلاعات پست\n"
+                            "✅ دانلود ویدیو\n"
+                            "✅ ارسال به تلگرام...\n\n"
+                            "⏳ لطفاً کمی صبر کنید..."
+                        )
+                        
+                        await update.message.reply_video(
+                            video=video_path,
+                            caption="🎥 ویدیو شما با موفقیت دانلود شد!"
+                        )
+                    except Exception as e:
+                        print(f"Error sending video: {str(e)}")
+                else:
+                    raise Exception("فایل ویدیو پیدا نشد")
+            else:
+                await status_message.edit_text(
+                    "❌ این پست ویدیو نیست.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]]),
+                    parse_mode='Markdown'
+                )
+                
+        except Exception as e:
+            print(f"Error downloading video: {str(e)}")
+            keyboard = []
+            if is_admin(user.id):
+                keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
+            
+            error_message = (
+                "❌ خطا در دانلود ویدیو.\n"
+                "دلایل احتمالی:\n"
+                "• پست خصوصی است\n"
+                "• پست حذف شده است\n"
+                "• لینک نامعتبر است\n"
+                "• این پست ویدیو نیست\n\n"
+                "لطفاً دوباره تلاش کنید یا لینک دیگری ارسال کنید."
+            )
+            await status_message.delete()
+            await update.message.reply_text(
+                error_message,
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+            )
 
-async def track_channel_visitors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پیگیری بازدیدکنندگان کانال"""
-    # این تابع در یک برنامه واقعی نیاز به API اختصاصی تلگرام دارد
-    # در اینجا ما یک شبیه‌سازی انجام می‌دهیم
+async def handle_instagram_story(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     
-    # افزودن بازدیدکننده‌های جدید به صورت تصادفی
-    if random.random() < 0.3:  # 30% احتمال اضافه شدن بازدیدکننده جدید
-        visitor_id = random.randint(10000000, 99999999)
-        
-        # بررسی تکراری نبودن
-        if visitor_id not in [v.get('id') for v in channel_stats['visitors']]:
-            visitor_info = {
-                "id": visitor_id,
-                "visit_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "is_subscriber": False
-            }
-            channel_stats['visitors'].append(visitor_info)
-            channel_stats['total_views'] += 1
-            save_stats()
-
-async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور /users - استخراج آیدی عددی و نام کاربری همه کاربران کانال"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("این دستور فقط برای ادمین کانال در دسترس است.")
+    if await check_user_ban(user.id):
+        await update.message.reply_text(
+            "⛔️ شما از استفاده از ربات محروم شده‌اید!"
+        )
         return
     
-    await update.message.reply_text("در حال استخراج اطلاعات کاربران کانال...")
+    not_subscribed = await check_subscription(user.id, context)
+    if not_subscribed:
+        channels_text = "\n".join([f"- {channel['name']}" for channel in not_subscribed])
+        await update.message.reply_text(
+            f"برای استفاده از ربات، لطفا در کانال‌های زیر عضو شوید:\n{channels_text}",
+            reply_markup=get_subscription_keyboard(not_subscribed, is_admin(user.id))
+        )
+        return
+
+    message = update.message.text
+    
+    status_message = await update.message.reply_text(
+        "🔍 در حال پردازش لینک استوری...\n\n"
+        "⏳ مراحل دانلود:\n"
+        "◾️ بررسی لینک...\n"
+        "◾️ دریافت اطلاعات استوری...\n"
+        "◾️ دانلود...\n"
+        "◾️ ارسال به تلگرام...\n\n"
+        "⏳ لطفاً کمی صبر کنید..."
+    )
     
     try:
-        # استخراج اطلاعات کاربران از لیست اعضای ثبت شده
-        subscribers = channel_stats['subscribers']
+        await status_message.edit_text(
+            "🔍 در حال پردازش لینک استوری...\n\n"
+            "⏳ مراحل دانلود:\n"
+            "✅ بررسی لینک\n"
+            "◾️ دریافت اطلاعات استوری...\n"
+            "◾️ دانلود...\n"
+            "◾️ ارسال به تلگرام...\n\n"
+            "⏳ لطفاً کمی صبر کنید..."
+        )
+
+        # Extract username from the story link
+        username = message.split("instagram.com/stories/")[-1].split("/")[0]
+
+        url = "https://instagram-premium-api-2023.p.rapidapi.com/v1/user/stories/by/username"
+        querystring = {"username": username, "amount": "0"}
+        headers = {
+            "x-rapidapi-key": "ec164931cfmsh029a8d32327b1f5p13c235jsn7e9175855053",  # کلید API خود را اینجا قرار دهید
+            "x-rapidapi-host": "instagram-premium-api-2023.p.rapidapi.com"
+        }
+        response = requests.get(url, headers=headers, params=querystring)
+        response_json = response.json()
+        print(response_json)
+
+        if response.status_code != 200:
+            await status_message.edit_text(f"❌ خطایی رخ داد: {response_json.get('message', 'خطای ناشناخته')}")
+            return
+
+        await status_message.edit_text(
+            "🔍 در حال پردازش لینک استوری...\n\n"
+            "⏳ مراحل دانلود:\n"
+            "✅ بررسی لینک\n"
+            "✅ دریافت اطلاعات استوری\n"
+            "◾️ دانلود...\n"
+            "◾️ ارسال به تلگرام...\n\n"
+            "⏳ لطفاً کمی صبر کنید..."
+        )
+
+        # Process each story item
+        if response_json and isinstance(response_json, list):
+            for story in response_json:
+                media_type = story.get('media_type')
+                if media_type == 2:  # Video
+                    media_url = story.get('video_url')
+                elif media_type == 1:  # Image
+                    media_url = story.get('thumbnail_url')
+                else:
+                    continue
+
+                if not media_url:
+                    continue
+
+                # تغییر روش دانلود فایل
+                temp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix='.mp4' if media_type == 2 else '.jpg', delete=False) as temp_file:
+                        temp_path = temp_file.name
+                        session = requests.Session()
+                        retries = 3
+                        while retries > 0:
+                            try:
+                                response = session.get(media_url, stream=True, timeout=30)
+                                response.raise_for_status()
+                                total_size = int(response.headers.get('content-length', 0))
+                                block_size = 1024 * 1024
+                                with open(temp_path, 'wb') as file:
+                                    for data in response.iter_content(block_size):
+                                        file.write(data)
+                                break
+                            except (requests.exceptions.RequestException, IOError) as e:
+                                retries -= 1
+                                if retries == 0:
+                                    raise e
+                                await asyncio.sleep(1)
+
+                    if media_type == 2:  # ویدیو
+                        await update.message.reply_video(
+                            video=open(temp_path, 'rb'),
+                            caption="🎥 استوری دانلود شد!"
+                        )
+                    else:  # عکس
+                        await update.message.reply_photo(
+                            photo=open(temp_path, 'rb'),
+                            caption="📸 استوری دانلود شد!"
+                        )
+
+                finally:
+                    if temp_path:
+                        try:
+                            os.unlink(temp_path)
+                        except:
+                            pass
+
+            # فقط در انتها یک بار پیام موفقیت نمایش داده شود
+            keyboard = []
+            if is_admin(user.id):
+                keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
+            
+            await status_message.delete()  # حذف پیام وضعیت قبلی
+            await update.message.reply_text(
+                "✅ عملیات با موفقیت انجام شد!",
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+            )
+
+        else:
+            keyboard = []
+            if is_admin(user.id):
+                keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
+            
+            await status_message.delete()  # حذف پیام وضعیت قبلی
+            await update.message.reply_text(
+                "❌ استوری‌ای برای دانلود پیدا نشد.",
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+            )
+
+    except Exception as e:
+        print(f"Error downloading story: {str(e)}")
+        keyboard = []
+        if is_admin(user.id):
+            keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
         
-        if not subscribers:
-            await update.message.reply_text("هیچ کاربری در لیست اعضای ثبت شده وجود ندارد.\n"
-                                           "توجه: فقط کاربرانی که بعد از راه‌اندازی ربات به کانال پیوسته‌اند در این لیست ثبت می‌شوند.")
+        error_message = (
+            "❌ خطا در دانلود استوری.\n"
+            "دلایل احتمالی:\n"
+            "• استوری خصوصی است\n"
+            "• استوری حذف شده است\n"
+            "• لینک نامعتبر است\n\n"
+            "لطفاً دوباره تلاش کنید یا لینک دیگری ارسال کنید."
+        )
+        await status_message.delete()  # حذف پیام وضعیت قبلی
+        await update.message.reply_text(
+            error_message,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+        )
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔️ شما دسترسی به این بخش را ندارید.")
+        return
+    
+    context.user_data['waiting_for_broadcast'] = True
+    
+    keyboard = [[InlineKeyboardButton("❌ لغو", callback_data="cancel_broadcast")]]
+    await update.message.reply_text(
+        "📬 لطفاً پیام مورد نظر خود را برای ارسال همگانی ارسال کنید.\n"
+        "می‌توانید متن، عکس، ویدیو، فایل یا صوت ارسال کنید.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def handle_broadcast_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media_type: str, file_id: str):
+    if context.user_data.get('waiting_for_broadcast'):
+        context.user_data['broadcast_message'] = {
+            'media': file_id,
+            'media_type': media_type,
+            'text': update.message.caption if update.message.caption else ''
+        }
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ ارسال", callback_data="confirm_broadcast"),
+                InlineKeyboardButton("❌ لغو", callback_data="cancel_broadcast")
+            ]
+        ]
+        
+        preview_text = "📬 پیش‌نمایش پیام:\n\n"
+        if update.message.caption:
+            preview_text += f"متن پیام: {update.message.caption}\n"
+        preview_text += f"\nنوع رسانه: {media_type}"
+        
+        try:
+            if media_type == 'photo':
+                preview_message = await update.message.reply_photo(
+                    photo=file_id,
+                    caption=preview_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            elif media_type == 'video':
+                preview_message = await update.message.reply_video(
+                    video=file_id,
+                    caption=preview_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            elif media_type == 'document':
+                preview_message = await update.message.reply_document(
+                    document=file_id,
+                    caption=preview_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            elif media_type == 'audio':
+                preview_message = await update.message.reply_audio(
+                    audio=file_id,
+                    caption=preview_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            
+            context.user_data['preview_message'] = preview_message
+            
+        except Exception as e:
+            print(f"Error sending preview: {str(e)}")
+            await update.message.reply_text(
+                "❌ خطا در ارسال پیش‌نمایش. لطفاً دوباره تلاش کنید.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_broadcast")]])
+            )
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('waiting_for_broadcast') and is_admin(update.effective_user.id):
+        await handle_broadcast_media(update, context, 'photo', update.message.photo[-1].file_id)
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('waiting_for_broadcast') and is_admin(update.effective_user.id):
+        await handle_broadcast_media(update, context, 'video', update.message.video.file_id)
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('waiting_for_broadcast') and is_admin(update.effective_user.id):
+        await handle_broadcast_media(update, context, 'document', update.message.document.file_id)
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('waiting_for_broadcast') and is_admin(update.effective_user.id):
+        await handle_broadcast_media(update, context, 'audio', update.message.audio.file_id)
+
+async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_info = await context.bot.get_me()
+    
+    if any(member.id == bot_info.id for member in update.message.new_chat_members):
+        chat = update.effective_chat
+        user = update.effective_user
+        
+        conn = sqlite3.connect('bot_database.db')
+        c = conn.cursor()
+        
+        try:
+            c.execute(
+                "INSERT OR REPLACE INTO groups (group_id, group_name, added_by) VALUES (?, ?, ?)",
+                (chat.id, chat.title, user.id)
+            )
+            conn.commit()
+            
+            await update.message.reply_text(
+                "✅ ربات با موفقیت به گروه اضافه شد!\n\n"
+                "لطفاً مطمئن شوید که ربات دسترسی‌های لازم را دارد:\n"
+                "• ارسال پیام\n"
+                "• ویرایش پیام\n"
+                "• حذف پیام\n"
+                "جهت استفاده از ربات در گروه خود، لطفاً دستور /d را ارسال کنید."
+            )
+        except Exception as e:
+            print(f"Error saving group: {str(e)}")
+        finally:
+            conn.close()
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+        
+    keyboard = [
+        [InlineKeyboardButton("افزودن کانال جدید ➕", callback_data="add_channel")],
+        [InlineKeyboardButton("حذف کانال ➖", callback_data="del_channel")],
+        [InlineKeyboardButton("لیست کانال‌ها 📋", callback_data="list_channels")],
+        [InlineKeyboardButton("آمار ربات 📊", callback_data="stats")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "🔰 پنل مدیریت ربات:",
+        reply_markup=reply_markup
+    )
+
+async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+        
+    if not context.args:
+        await update.message.reply_text(
+            "برای افزودن کانال، آیدی عددی کانال را وارد کنید:\n"
+            "مثال: /add_channel -1001234567890"
+        )
+        return
+        
+    channel_id = context.args[0]
+    try:
+        chat = await context.bot.get_chat(channel_id)
+        chat_member = await context.bot.get_chat_member(chat_id=channel_id, user_id=context.bot.id)
+        
+        if chat_member.status != 'administrator':
+            await update.message.reply_text("❌ لطفا ابتدا ربات را در کانال ادمین کنید.")
+            return
+            
+        conn = sqlite3.connect('bot_database.db')
+        c = conn.cursor()
+        channel_username = chat.username if chat.username else str(channel_id)
+        c.execute(
+            "INSERT OR REPLACE INTO channels (channel_id, name, username) VALUES (?, ?, ?)",
+            (channel_id, f"@{channel_username}", f"@{channel_username}")
+        )
+        conn.commit()
+        conn.close()
+        
+        await update.message.reply_text(f"✅ کانال @{channel_username} با موفقیت اضافه شد.")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در افزودن کانال: {str(e)}")
+
+async def del_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+        
+    conn = sqlite3.connect('bot_database.db')
+    c = conn.cursor()
+    channels = c.execute("SELECT channel_id, name FROM channels").fetchall()
+    
+    if not channels:
+        await update.message.reply_text("❌ هیچ کانالی در لیست وجود ندارد.")
+        conn.close()
+        return
+        
+    if not context.args:
+        channels_text = "\n".join([f"{i+1}. {ch[1]} ({ch[0]})" for i, ch in enumerate(channels)])
+        await update.message.reply_text(
+            "برای حذف کانال، شماره آن را وارد کنید:\n"
+            f"{channels_text}\n"
+            "مثال: /del_channel 1"
+        )
+        conn.close()
+        return
+        
+    try:
+        index = int(context.args[0]) - 1
+        if 0 <= index < len(channels):
+            channel = channels[index]
+            c.execute("DELETE FROM channels WHERE channel_id = ?", (channel[0],))
+            conn.commit()
+            await update.message.reply_text(f"✅ کانال {channel[1]} با موفقیت حذف شد.")
+        else:
+            await update.message.reply_text("❌ شماره کانال نامعتبر است.")
+    except:
+        await update.message.reply_text("❌ لطفا یک عدد معتبر وارد کنید.")
+    finally:
+        conn.close()
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+        
+    conn = sqlite3.connect('bot_database.db')
+    c = conn.cursor()
+    
+    admin_ids_tuple = tuple(ADMIN_IDS)
+    if len(admin_ids_tuple) == 1:
+        users_count = c.execute("SELECT COUNT(*) FROM users WHERE user_id != ?", (admin_ids_tuple[0],)).fetchone()[0]
+    else:
+        users_count = c.execute(f"SELECT COUNT(*) FROM users WHERE user_id NOT IN ({','.join(['?' for _ in admin_ids_tuple])})", admin_ids_tuple).fetchone()[0]
+    
+    groups_count = c.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+    
+    conn.close()
+    
+    stats_text = (
+        "📊 آمار ربات:\n\n"
+        f"👤 تعداد کاربران: {users_count}\n"
+        f"👥 تعداد گروه‌ها: {groups_count}\n"
+        f"📢 تعداد کانال‌ها: {len(REQUIRED_CHANNELS)}"
+    )
+    
+    await update.message.reply_text(stats_text)
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    message = update.message.text
+    
+    if context.user_data.get('waiting_for_channel_id') and is_admin(user.id):
+        context.user_data.pop('waiting_for_channel_id')
+        try:
+            chat = await context.bot.get_chat(message)
+            chat_member = await context.bot.get_chat_member(chat_id=message, user_id=context.bot.id)
+            
+            if chat_member.status != 'administrator':
+                await update.message.reply_text(
+                    "❌ لطفا ابتدا ربات را در کانال ادمین کنید.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]])
+                )
+                return
+                
+            conn = sqlite3.connect('bot_database.db')
+            c = conn.cursor()
+            channel_username = chat.username if chat.username else str(message)
+            c.execute(
+                "INSERT OR REPLACE INTO channels (channel_id, name, username) VALUES (?, ?, ?)",
+                (message, f"@{channel_username}", f"@{channel_username}")
+            )
+            conn.commit()
+            conn.close()
+            
+            await update.message.reply_text(
+                f"✅ کانال @{channel_username} با موفقیت اضافه شد.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]])
+            )
+            
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ خطا در بررسی کانال: {str(e)}\n\nلطفاً یک آیدی معتبر وارد کنید.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]])
+            )
+        return
+    
+    if "instagram.com" in message:
+        await handle_instagram_link(update, context)
+        return
+
+    elif context.user_data.get('waiting_for_broadcast') and is_admin(update.effective_user.id):
+        context.user_data['broadcast_message'] = {
+            'text': message
+        }
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ ارسال", callback_data="confirm_broadcast"),
+                InlineKeyboardButton("❌ لغو", callback_data="cancel_broadcast")
+            ]
+        ]
+        
+        preview_text = "📬 پیش‌نمایش پیام:\n\n"
+        preview_text += message
+        
+        preview_message = await update.message.reply_text(
+            preview_text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        context.user_data['preview_message'] = preview_message
+    
+    elif update.message.chat.type in ['group', 'supergroup']:
+        await update.message.reply_text(
+            "برای دانلود ویدیو از دستور /d استفاده کنید.\n"
+            "مثال:\n"
+            "/d https://www.instagram.com/p/xxx"
+        )
+        return
+    
+    else:
+        context.user_data['instagram_link'] = message
+        await handle_instagram_link(update, context)
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    await query.answer()
+    
+    if query.data == "admin_panel" and is_admin(user_id):
+        keyboard = [
+            [
+                InlineKeyboardButton("📊 آمار", callback_data="stats"),
+                InlineKeyboardButton("📢 ارسال پیام", callback_data="broadcast_init")
+            ],
+            [
+                InlineKeyboardButton("➕ افزودن کانال", callback_data="add_channel"),
+                InlineKeyboardButton("❌ حذف کانال", callback_data="del_channel")
+            ],
+            [
+                InlineKeyboardButton("📡 وضعیت سرور", callback_data="server_status"),
+                InlineKeyboardButton("🔄 راه‌اندازی مجدد", callback_data="restart_bot")
+            ],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "🔰 پنل مدیریت ربات:",
+            reply_markup=reply_markup
+        )
+        return
+
+    if query.data == "back_to_main":
+        user = query.from_user
+        welcome_message = f"سلام [{user.first_name}](tg://user?id={user.id})!\n"
+        welcome_message += "می‌توانید لینک پست اینستاگرام را ارسال کنید تا برایتان ویدیو را بفرستم."
+        
+        keyboard = []
+        if is_admin(user.id):
+            keyboard.append([InlineKeyboardButton("🎛 پنل ادمین", callback_data="admin_panel")])
+        
+        keyboard.append([
+            InlineKeyboardButton("➕ افزودن به گروه", callback_data="add_to_group"),
+            InlineKeyboardButton("➕ افزودن به کانال", callback_data="add_to_channel")
+        ])
+        
+        await query.edit_message_text(
+            welcome_message,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if query.data in ["check_subscription", "add_to_group", "back_to_main", "add_to_channel"]:
+        if query.data == "add_to_channel":
+            bot_info = await context.bot.get_me()
+            add_to_channel_link = f"https://t.me/{bot_info.username}?startchannel=true"
+            keyboard = [
+                [InlineKeyboardButton("➕ افزودن به کانال", url=add_to_channel_link)],
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]
+            ]
+            await query.edit_message_text(
+                "برای افزودن ربات به کانال خود:\n\n"
+                "1️⃣ روی دکمه زیر کلیک کنید\n"
+                "2️⃣ کانال مورد نظر را انتخاب کنید\n"
+                "3️⃣ دسترسی‌های لازم را به ربات بدهید",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+            
+        elif query.data == "back_to_main":
+            keyboard = []
+            
+            if is_admin(user_id):
+                keyboard.append([InlineKeyboardButton("🎛 پنل ادمین", callback_data="admin_panel")])
+            
+            keyboard.append([
+                InlineKeyboardButton("➕ افزودن به گروه", callback_data="add_to_group"),
+                InlineKeyboardButton("➕ افزودن به کانال", callback_data="add_to_channel")
+            ])
+            
+            await query.edit_message_text(
+                f"سلام [{query.from_user.first_name}](tg://user?id={user_id})!\n"
+                "می‌توانید لینک پست اینستاگرام را ارسال کنید تا برایتان ویدیو را بفرستم.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            return
+            
+        elif query.data == "check_subscription":
+            not_subscribed = await check_subscription(user_id, context)
+            if not not_subscribed:
+                await query.edit_message_text(
+                    f"✅ عضویت شما تأیید شد.\n"
+                    f"می‌توانید لینک پست اینستاگرام را ارسال کنید."
+                )
+            else:
+                channels_text = "\n".join([f"- {channel['name']}" for channel in not_subscribed])
+                await query.answer(f"لطفاً در کانال‌های زیر عضو شوید:\n{channels_text}", show_alert=True)
+            return
+            
+        elif query.data == "add_to_group":
+            bot_info = await context.bot.get_me()
+            add_to_group_link = f"https://t.me/{bot_info.username}?startgroup=new"
+            keyboard = [
+                [InlineKeyboardButton("➕ افزودن به گروه", url=add_to_group_link)],
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]
+            ]
+            await query.edit_message_text(
+                "برای افزودن ربات به گروه خود:\n\n"
+                "1️⃣ روی دکمه زیر کلیک کنید\n"
+                "2️⃣ گروه مورد نظر را انتخاب کنید\n"
+                "3️⃣ دسترسی‌های لازم را به ربات بدهید",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+    
+    if not is_admin(user_id):
+        await query.answer("⛔️ شما دسترسی به این بخش را ندارید.", show_alert=True)
+        return
+        
+    if query.data == "broadcast_init":
+        context.user_data['waiting_for_broadcast'] = True
+        keyboard = [[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]]
+        await query.edit_message_text(
+            "📝 پیام خود را برای ارسال همگانی ارسال کنید.\n\n"
+            "💡 نکات:\n"
+            "• می‌توانید پیام را همراه با عکس، ویدیو، صوت یا فایل ارسال کنید\n"
+            "• برای لغو، دستور /cancel را ارسال کنید",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif query.data == "confirm_broadcast":
+        broadcast_data = context.user_data.get('broadcast_message')
+        if broadcast_data:
+            await query.message.edit_reply_markup(reply_markup=None)
+            
+            status_message = await query.message.reply_text(
+                "⏳ در حال ارسال پیام به کاربران و گروه‌ها...\n"
+                "لطفاً صبر کنید."
+            )
+            
+            conn = sqlite3.connect('bot_database.db')
+            c = conn.cursor()
+            
+            try:
+                admin_ids_tuple = tuple(ADMIN_IDS)
+                if len(admin_ids_tuple) == 1:
+                    users = c.execute("SELECT DISTINCT user_id FROM users WHERE user_id != ?", (admin_ids_tuple[0],)).fetchall()
+                else:
+                    users = c.execute(f"SELECT DISTINCT user_id FROM users WHERE user_id NOT IN ({','.join(['?' for _ in admin_ids_tuple])})", admin_ids_tuple).fetchall()
+                
+                groups = c.execute("SELECT DISTINCT group_id FROM groups").fetchall()
+                
+                success = 0
+                failed = 0
+                
+                all_chats = users + groups
+                for chat in all_chats:
+                    try:
+                        if 'media' in broadcast_data:
+                            media_type = broadcast_data['media_type']
+                            file_id = broadcast_data['media']
+                            caption = broadcast_data.get('text', '')
+                            
+                            if media_type == 'photo':
+                                await context.bot.send_photo(
+                                    chat_id=chat[0],
+                                    photo=file_id,
+                                    caption=caption,
+                                    parse_mode='HTML'
+                                )
+                            elif media_type == 'video':
+                                await context.bot.send_video(
+                                    chat_id=chat[0],
+                                    video=file_id,
+                                    caption=caption,
+                                    parse_mode='HTML'
+                                )
+                            elif media_type == 'document':
+                                await context.bot.send_document(
+                                    chat_id=chat[0],
+                                    document=file_id,
+                                    caption=caption,
+                                    parse_mode='HTML'
+                                )
+                            elif media_type == 'audio':
+                                await context.bot.send_audio(
+                                    chat_id=chat[0],
+                                    audio=file_id,
+                                    caption=caption,
+                                    parse_mode='HTML'
+                                )
+                        else:
+                            await context.bot.send_message(
+                                chat_id=chat[0],
+                                text=broadcast_data.get('text', ''),
+                                parse_mode='HTML'
+                            )
+                        success += 1
+                        await asyncio.sleep(0.05)
+                    except Exception as e:
+                        print(f"Error sending to chat {chat[0]}: {str(e)}")
+                        failed += 1
+                
+                keyboard = [[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]]
+                await status_message.edit_text(
+                    f"✅ ارسال پیام به پایان رسید!\n\n"
+                    f"📊 آمار ارسال:\n"
+                    f"👤 تعداد کل: {len(all_chats)}\n"
+                    f"✓ ارسال موفق: {success}\n"
+                    f"✗ ارسال ناموفق: {failed}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                
+            except Exception as e:
+                keyboard = [[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]]
+                await status_message.edit_text(
+                    f"❌ خطا در ارسال پیام: {str(e)}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            
+            finally:
+                conn.close()
+                context.user_data.pop('broadcast_message', None)
+                context.user_data.pop('waiting_for_broadcast', None)
+    
+    elif query.data == "cancel_broadcast":
+        context.user_data.pop('broadcast_message', None)
+        context.user_data.pop('waiting_for_broadcast', None)
+        
+        keyboard = [[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]]
+        await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text(
+            "❌ ارسال پیام لغو شد.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif query.data == "add_channel" and is_admin(user_id):
+        keyboard = [[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]]
+        await query.edit_message_text(
+            "برای افزودن کانال جدید، آیدی عددی کانال را وارد کنید.\n\n"
+            "⚠️ نکات مهم:\n"
+            "• ربات باید در کانال ادمین باشد\n"
+            "• آیدی عددی باید با - شروع شود\n"
+            "• مثال: -1001234567890\n\n"
+            "🔹 برای دریافت آیدی عددی کانال، یک پیام از کانال را فوروارد کنید به @userinfobot",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        context.user_data['waiting_for_channel_id'] = True
+    
+    elif query.data == "del_channel" and is_admin(user_id):
+        conn = sqlite3.connect('bot_database.db')
+        c = conn.cursor()
+        channels = c.execute("SELECT channel_id, name FROM channels").fetchall()
+        conn.close()
+
+        if not channels:
+            keyboard = [[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]]
+            await query.edit_message_text(
+                "❌ هیچ کانالی در لیست عضویت اجباری وجود ندارد.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
             return
         
-        # تعداد کاربران در هر صفحه
-        page_size = 30
-        total_users = len(subscribers)
+        keyboard = []
+        for channel in channels:
+            keyboard.append([InlineKeyboardButton(
+                f"❌ {channel[1]}",
+                callback_data=f"remove_channel_{channel[0]}"
+            )])
+        keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
         
-        # ارسال لیست کاربران به صورت صفحه‌بندی شده
-        for i in range(0, total_users, page_size):
-            page_users = subscribers[i:i+page_size]
-            
-            # تهیه متن پیام
-            users_text = ""
-            for user in page_users:
-                user_id = user.get('id', 'نامشخص')
-                username = user.get('username', 'ندارد')
-                first_name = user.get('first_name', '')
-                last_name = user.get('last_name', '')
-                full_name = f"{first_name} {last_name}".strip() or 'نامشخص'
-                
-                users_text += f"👤 آیدی: {user_id}\n"
-                users_text += f"🔖 نام کاربری: {'@' + username if username else 'ندارد'}\n"
-                users_text += f"📝 نام: {full_name}\n"
-                users_text += f"📅 تاریخ عضویت: {user.get('joined_date', 'نامشخص')}\n"
-                users_text += "───────────────\n"
-            
-            header = f"📋 اطلاعات کاربران کانال (صفحه {i//page_size + 1}/{(total_users+page_size-1)//page_size}):\n\n"
-            
-            await update.message.reply_text(header + users_text)
-            
-            # کمی صبر بین ارسال پیام‌ها
-            if i + page_size < total_users:
-                await asyncio.sleep(1)
-        
-        # افزودن پیام خلاصه
-        await update.message.reply_text(f"🔢 تعداد کل کاربران استخراج شده: {total_users}\n"
-                                        f"⚠️ توجه: این فقط اطلاعات کاربرانی است که هنگام فعالیت ربات به کانال پیوسته‌اند.")
-    except Exception as e:
-        logger.error(f"خطا در استخراج اطلاعات کاربران: {e}")
-        await update.message.reply_text(f"خطا در استخراج اطلاعات کاربران: {str(e)}")
-
-async def remove_deleted_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور /remove_deleted - حذف کاربران با حساب حذف شده از کانال"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("این دستور فقط برای ادمین کانال در دسترس است.")
-        return
+        await query.edit_message_text(
+            "برای حذف کانال، روی آن کلیک کنید:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     
-    await update.message.reply_text("در حال بررسی و حذف حساب‌های حذف شده از کانال...")
-    
-    try:
-        bot = context.bot
-        chat = await bot.get_chat(CHANNEL_ID)
-        deleted_count = 0
-        
-        # بررسی لیست اعضای ثبت شده در ربات
-        for member in channel_stats['subscribers'][:]:  # استفاده از کپی لیست برای امکان حذف در حین تکرار
-            try:
-                user_id = member.get('id')
-                if not user_id:
-                    continue
-                
-                # تلاش برای دریافت اطلاعات کاربر
-                try:
-                    chat_member = await bot.get_chat_member(chat.id, user_id)
-                    user = chat_member.user
-                    
-                    # بررسی اینکه آیا کاربر حساب حذف شده است
-                    if user.is_deleted:
-                        # حذف کاربر از کانال
-                        await bot.ban_chat_member(chat.id, user_id)
-                        # لغو محرومیت بلافاصله (برای اینکه فقط حذف شود نه اینکه بن شود)
-                        await bot.unban_chat_member(chat.id, user_id)
-                        
-                        # حذف کاربر از لیست اعضا
-                        channel_stats['subscribers'] = [sub for sub in channel_stats['subscribers'] if sub.get('id') != user_id]
-                        
-                        logger.info(f"کاربر با حساب حذف شده (آیدی: {user_id}) از کانال حذف شد")
-                        deleted_count += 1
-                        
-                        # کمی تأخیر برای جلوگیری از محدودیت درخواست
-                        await asyncio.sleep(0.5)
-                except Exception as e:
-                    logger.warning(f"خطا در بررسی کاربر {user_id}: {e}")
-                    continue
-            except Exception as e:
-                logger.warning(f"خطا در پردازش یک عضو از لیست: {e}")
-        
-        # به‌روزرسانی آمار
+    elif query.data.startswith("remove_channel_") and is_admin(user_id):
+        channel_id = query.data.replace("remove_channel_", "")
+        conn = sqlite3.connect('bot_database.db')
+        c = conn.cursor()
         try:
-            member_count = await chat.get_member_count()
-            channel_stats['member_count'] = member_count
+            channel_name = c.execute("SELECT name FROM channels WHERE channel_id = ?", (channel_id,)).fetchone()[0]
+            c.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+            conn.commit()
+            keyboard = [[InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]]
+            await query.edit_message_text(
+                f"✅ کانال {channel_name} با موفقیت حذف شد.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
         except Exception as e:
-            logger.error(f"خطا در به‌روزرسانی تعداد اعضا: {e}")
-        
-        save_stats()
-        
-        if deleted_count > 0:
-            await update.message.reply_text(f"عملیات با موفقیت انجام شد. {deleted_count} حساب حذف شده از کانال حذف شدند.")
-        else:
-            await update.message.reply_text("هیچ حساب حذف شده‌ای در کانال یافت نشد.")
-    except Exception as e:
-        logger.error(f"خطا در حذف حساب‌های حذف شده: {e}")
-        await update.message.reply_text(f"خطا در انجام عملیات: {str(e)}")
+            await query.answer("❌ خطا در حذف کانال!", show_alert=True)
+        finally:
+            conn.close()
 
-async def auto_clean_deleted_accounts(context: ContextTypes.DEFAULT_TYPE):
-    """تابع خودکار برای پاکسازی منظم حساب‌های حذف شده از کانال"""
-    try:
-        bot = context.bot
-        chat = await bot.get_chat(CHANNEL_ID)
-        deleted_count = 0
+    elif query.data == "stats" and is_admin(user_id):
+        conn = sqlite3.connect('bot_database.db')
+        c = conn.cursor()
         
-        logger.info("شروع بررسی خودکار حساب‌های حذف شده...")
+        try:
+            admin_ids_tuple = tuple(ADMIN_IDS)
+            if len(admin_ids_tuple) == 1:
+                users_count = c.execute("SELECT COUNT(*) FROM users WHERE user_id != ?", (admin_ids_tuple[0],)).fetchone()[0]
+            else:
+                users_count = c.execute(f"SELECT COUNT(*) FROM users WHERE user_id NOT IN ({','.join(['?' for _ in admin_ids_tuple])})", admin_ids_tuple).fetchone()[0]
+            
+            groups_count = c.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+            
+            stats_text = (
+                "📊 آمار ربات:\n\n"
+                f"👤 تعداد کاربران: {users_count}\n"
+                f"👥 تعداد گروه‌ها: {groups_count}\n"
+                f"📢 تعداد کانال‌ها: {len(REQUIRED_CHANNELS)}"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("👥 لیست کاربران", callback_data="users_list")],
+                [InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]
+            ]
+            await query.edit_message_text(
+                stats_text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            await query.answer(f"❌ خطا در دریافت آمار: {str(e)}", show_alert=True)
         
-        # بررسی لیست اعضای ثبت شده در ربات
-        for member in channel_stats['subscribers'][:]:
+        finally:
+            conn.close()
+
+    elif query.data == "users_list" or query.data.startswith("users_page_"):
+        if not is_admin(user_id):
+            return
+        
+        page = 1
+        if query.data.startswith("users_page_"):
             try:
-                user_id = member.get('id')
-                if not user_id:
-                    continue
+                page = int(query.data.replace("users_page_", ""))
+            except ValueError:
+                page = 1
+        
+        USERS_PER_PAGE = 5
+        offset = (page - 1) * USERS_PER_PAGE
+        
+        conn = sqlite3.connect('bot_database.db')
+        c = conn.cursor()
+        try:
+            admin_ids_tuple = tuple(ADMIN_IDS)
+            
+            # ابتدا تعداد کل کاربران را می‌شماریم
+            if len(admin_ids_tuple) == 1:
+                total_users = c.execute(
+                    "SELECT COUNT(*) FROM users WHERE user_id != ?",
+                    (admin_ids_tuple[0],)
+                ).fetchone()[0]
+            else:
+                total_users = c.execute(
+                    f"SELECT COUNT(*) FROM users WHERE user_id NOT IN ({','.join(['?' for _ in admin_ids_tuple])})",
+                    admin_ids_tuple
+                ).fetchone()[0]
+            
+            total_pages = (total_users + USERS_PER_PAGE - 1) // USERS_PER_PAGE
+            
+            # سپس کاربران صفحه فعلی را دریافت می‌کنیم
+            if len(admin_ids_tuple) == 1:
+                users = c.execute("""
+                    SELECT user_id, username, first_name, unique_id, is_banned, join_date 
+                    FROM users 
+                    WHERE user_id != ?
+                    ORDER BY join_date DESC 
+                    LIMIT ? OFFSET ?
+                """, (admin_ids_tuple[0], USERS_PER_PAGE, offset)).fetchall()
+            else:
+                users = c.execute(f"""
+                    SELECT user_id, username, first_name, unique_id, is_banned, join_date 
+                    FROM users 
+                    WHERE user_id NOT IN ({','.join(['?' for _ in admin_ids_tuple])})
+                    ORDER BY join_date DESC 
+                    LIMIT ? OFFSET ?
+                """, (*admin_ids_tuple, USERS_PER_PAGE, offset)).fetchall()
+            
+            if not users:
+                keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="stats")]]
+                await query.edit_message_text(
+                    "❌ هیچ کاربری یافت نشد!",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                return
+            
+            text = f"لیست کاربران (صفحه {page} از {total_pages}):\n\n"
+            keyboard = []
+            
+            for i, user in enumerate(users, offset + 1):
+                user_id, username, first_name, unique_id, is_banned, join_date = user
+                status = "🚫" if is_banned else "✅"
+                text += f"{i}. {status} کاربر: {first_name or 'نامشخص'}\n"
+                text += f"├ 🆔 شناسه یکتا: `{unique_id}`\n"
+                text += f"├ 👤 آیدی عددی: `{user_id}`\n"
+                text += f"├ 📝 نام کاربری: {f'@{username}' if username else 'تنظیم نشده'}\n"
+                text += f"├ 📅 تاریخ عضویت: {join_date}\n"
+                text += f"└ وضعیت: {'🔒 مسدود' if is_banned else '✅ فعال'}\n\n"
                 
-                # تلاش برای دریافت اطلاعات کاربر
+                btn_text = f"{'رفع مسدودیت 🔓' if is_banned else 'مسدودسازی 🔒'} کاربر {i}"
+                keyboard.append([InlineKeyboardButton(
+                    btn_text,
+                    callback_data=f"toggle_ban_{user_id}"
+                )])
+            
+            # دکمه‌های پیمایش صفحات
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("◀️ صفحه قبل", callback_data=f"users_page_{page-1}"))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("صفحه بعد ▶️", callback_data=f"users_page_{page+1}"))
+            
+            if nav_buttons:
+                keyboard.append(nav_buttons)
+            
+            keyboard.append([
+                InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="current_page"),
+                InlineKeyboardButton("🔄 بروزرسانی", callback_data=f"users_page_{page}")
+            ])
+            keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="stats")])
+            
+            await query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            await query.answer(f"❌ خطا: {str(e)}", show_alert=True)
+        finally:
+            conn.close()
+
+    elif query.data.startswith("toggle_ban_") and is_admin(user_id):
+        target_user_id = int(query.data.replace("toggle_ban_", ""))
+        conn = sqlite3.connect('bot_database.db')
+        c = conn.cursor()
+        try:
+            # بررسی وضعیت فعلی کاربر
+            current_status = c.execute(
+                "SELECT is_banned, first_name, username FROM users WHERE user_id = ?", 
+                (target_user_id,)
+            ).fetchone()
+            
+            if current_status:
+                is_banned, first_name, username = current_status
+                new_status = 0 if is_banned else 1
+                c.execute(
+                    "UPDATE users SET is_banned = ? WHERE user_id = ?",
+                    (new_status, target_user_id)
+                )
+                conn.commit()
+                
+                user_info = f"{first_name or 'ناشناس'}"
+                if username:
+                    user_info += f" (@{username})"
+                
+                # ارسال پیام به کاربر در صورت رفع مسدودیت
+                if new_status == 0:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=target_user_id,
+                            text="حساب کاربری شما از حالت مسدود خارج شد!\n"
+                                 "می‌توانید دوباره از ربات استفاده کنید."
+                        )
+                    except Exception as e:
+                        print(f"Error sending unban message: {str(e)}")
+                
+                status_text = "مسدود" if new_status else "رفع مسدود"
+                await query.answer(
+                    f"✅ کاربر {user_info} با موفقیت {status_text} شد!",
+                    show_alert=True
+                )
+                
+                # در انتهای بخش موفقیت‌آمیز، به جای بازگشت مستقیم به لیست کاربران:
+                # قبل از اجرای دستور toggle_ban، شماره صفحه فعلی را از متن پیام استخراج می‌کنیم
                 try:
-                    chat_member = await bot.get_chat_member(chat.id, user_id)
-                    user = chat_member.user
-                    
-                    # بررسی اینکه آیا کاربر حساب حذف شده است
-                    if user.is_deleted:
-                        # حذف کاربر از کانال
-                        await bot.ban_chat_member(chat.id, user_id)
-                        # لغو محرومیت بلافاصله (برای اینکه فقط حذف شود نه اینکه بن شود)
-                        await bot.unban_chat_member(chat.id, user_id)
-                        
-                        # حذف کاربر از لیست اعضا
-                        channel_stats['subscribers'] = [sub for sub in channel_stats['subscribers'] if sub.get('id') != user_id]
-                        
-                        logger.info(f"کاربر با حساب حذف شده (آیدی: {user_id}) به طور خودکار از کانال حذف شد")
-                        deleted_count += 1
-                        
-                        # کمی تأخیر برای جلوگیری از محدودیت درخواست
-                        await asyncio.sleep(0.5)
-                except Exception as e:
-                    logger.warning(f"خطا در بررسی خودکار کاربر {user_id}: {e}")
-                    continue
-            except Exception as e:
-                logger.warning(f"خطا در پردازش یک عضو از لیست در بررسی خودکار: {e}")
+                    message_text = query.message.text
+                    current_page = 1
+                    if "صفحه" in message_text:
+                        current_page = int(message_text.split("صفحه")[1].split("از")[0].strip())
+                except:
+                    current_page = 1
+                
+                # بازگشت به همان صفحه
+                await query.data_callback(f"users_page_{current_page}", update, context)
+                
+            else:
+                await query.answer("❌ کاربر مورد نظر یافت نشد!", show_alert=True)
+                
+        except Exception as e:
+            await query.answer(f"❌ خطا در تغییر وضعیت کاربر: {str(e)}", show_alert=True)
+        finally:
+            conn.close()
+
+    # مدیریت وضعیت سرور
+    elif query.data == "server_status" and is_admin(user_id):
+        # دریافت وضعیت اتصال
+        connection_status = connection_manager.get_connection_status()
         
-        # به‌روزرسانی آمار
-        if deleted_count > 0:
-            try:
-                member_count = await chat.get_member_count()
-                channel_stats['member_count'] = member_count
-                save_stats()
-                logger.info(f"پاکسازی خودکار انجام شد. {deleted_count} حساب حذف شده از کانال حذف شدند.")
-            except Exception as e:
-                logger.error(f"خطا در به‌روزرسانی آمار پس از پاکسازی خودکار: {e}")
-    except Exception as e:
-        logger.error(f"خطا در پاکسازی خودکار حساب‌های حذف شده: {e}")
+        # ایجاد پیام وضعیت سرور
+        server_status = server_monitor.format_status_message()
+        
+        # اضافه کردن وضعیت اتصال به پیام
+        connection_message = "\n🔌 وضعیت اتصال:\n"
+        connection_message += f"├ اتصال فعلی: {'✅ متصل' if connection_status['is_connected'] else '❌ قطع'}\n"
+        
+        if connection_status['last_connected']:
+            last_connected = datetime.fromtimestamp(connection_status['last_connected'])
+            connection_message += f"├ آخرین اتصال: {last_connected.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        
+        if connection_status['last_disconnect']:
+            last_disconnect = datetime.fromtimestamp(connection_status['last_disconnect'])
+            connection_message += f"├ آخرین قطعی: {last_disconnect.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        
+        connection_message += f"└ تعداد تلاش‌های اتصال مجدد: {connection_status['reconnect_attempts']}\n"
+        
+        # ترکیب پیام‌ها
+        complete_status = server_status + connection_message
+        
+        # ایجاد دکمه‌های مدیریتی
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 به‌روزرسانی", callback_data="refresh_status"),
+                InlineKeyboardButton("🔁 راه‌اندازی مجدد", callback_data="restart_bot")
+            ],
+            [InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]
+        ]
+        
+        await query.edit_message_text(
+            complete_status,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif query.data == "refresh_status" and is_admin(user_id):
+        await query.edit_message_text(
+            "🔄 در حال به‌روزرسانی وضعیت...",
+            reply_markup=None
+        )
+        
+        # ارسال مجدد وضعیت
+        await query.data_callback("server_status", update, context)
+    
+    elif query.data == "restart_bot" and is_admin(user_id):
+        restart_message = await query.edit_message_text(
+            "🔄 در حال راه‌اندازی مجدد ربات...\n"
+            "⏳ لطفاً صبر کنید...",
+            reply_markup=None
+        )
+        
+        logger.info(f"راه‌اندازی مجدد ربات توسط ادمین {user_id} درخواست شد")
+        
+        # ذخیره اطلاعات راه‌اندازی مجدد برای پیگیری بعد از راه‌اندازی
+        context.bot_data["restart_info"] = {
+            "chat_id": query.message.chat_id,
+            "message_id": query.message.message_id,
+            "time": time.time(),
+            "requested_by": user_id
+        }
+        
+        # قطع اتصال فعلی و راه‌اندازی مجدد
+        await connection_manager.shutdown()
+        
+        logger.info("ربات به زودی دوباره راه‌اندازی خواهد شد...")
 
-def extract_status_change(chat_member_update: ChatMemberUpdated) -> Optional[Tuple[bool, bool]]:
-    """استخراج تغییر وضعیت عضویت از یک به‌روزرسانی ChatMemberUpdated"""
-    status_change = chat_member_update.difference().get("status")
-    old_is_member, new_is_member = chat_member_update.difference().get("is_member", (None, None))
+async def check_user_ban(user_id: int) -> bool:
+    conn = sqlite3.connect('bot_database.db')
+    c = conn.cursor()
+    try:
+        result = c.execute(
+            "SELECT is_banned FROM users WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+        return bool(result and result[0])
+    finally:
+        conn.close()
 
-    if status_change is None:
-        return None
+async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.text.strip().lower() == "/d":
+        command_parts = update.message.text.split(maxsplit=1)
+        if len(command_parts) > 1:
+            not_subscribed = await check_subscription(update.effective_user.id, context)
+            if not_subscribed:
+                channels_text = "\n".join([f"- {channel['name']}" for channel in not_subscribed])
+                await update.message.reply_text(
+                    f"برای استفاده از ربات، لطفا در کانال‌های زیر عضو شوید:\n{channels_text}",
+                    reply_markup=get_subscription_keyboard(not_subscribed, is_admin(update.effective_user.id))
+                )
+                return
+                
+            context.user_data['instagram_link'] = command_parts[1]
+            await handle_instagram_link(update, context)
+        else:
+            await update.message.reply_text(
+                "لطفاً لینک پست اینستاگرام را بعد از دستور /d وارد کنید.\n"
+                "مثال:\n"
+                "/d https://www.instagram.com/p/xxx"
+            )
+    else:
+        await update.message.reply_text(
+            "لطفاً لینک پست اینستاگرام را بعد از دستور /d وارد کنید.\n"
+            "مثال:\n"
+            "/d https://www.instagram.com/p/xxx"
+        )
 
-    old_status, new_status = status_change
-    was_member = old_status in [
-        ChatMember.MEMBER,
-        ChatMember.OWNER,
-        ChatMember.ADMINISTRATOR,
-    ] or (old_status == ChatMember.RESTRICTED and old_is_member is True)
-    is_member = new_status in [
-        ChatMember.MEMBER,
-        ChatMember.OWNER,
-        ChatMember.ADMINISTRATOR,
-    ] or (new_status == ChatMember.RESTRICTED and new_is_member is True)
-
-    return was_member, is_member
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """مدیریت خطاهای به وجود آمده در حین اجرای ربات"""
-    logger.error(f"خطا در پردازش به‌روزرسانی: {context.error}")
-
-async def server_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور /server - نمایش وضعیت سرور و ربات"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("این دستور فقط برای ادمین کانال در دسترس است.")
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور نمایش وضعیت سرور و ربات"""
+    user = update.effective_user
+    
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔️ شما دسترسی به این بخش را ندارید.")
         return
     
-    try:
-        # محاسبه زمان آنلاین بودن
-        start_time = datetime.strptime(channel_stats["bot_start_time"], "%Y-%m-%d %H:%M:%S")
-        uptime_delta = datetime.now() - start_time
-        days = uptime_delta.days
-        hours, remainder = divmod(uptime_delta.seconds, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        
-        # استفاده از منابع
-        process = psutil.Process(os.getpid())
-        memory_usage = process.memory_info().rss / 1024 / 1024  # به مگابایت
-        cpu_usage = psutil.cpu_percent(interval=1)
-        
-        # اطلاعات سیستم
-        platform = sys.platform
-        python_version = sys.version.split()[0]
-        
-        status_text = f"""📊 وضعیت سرور و ربات:
-
-⏱️ زمان آنلاین بودن: {days} روز، {hours} ساعت، {minutes} دقیقه، {seconds} ثانیه
-🔄 تعداد راه‌اندازی مجدد: {channel_stats.get("restart_count", 1)}
-📆 آخرین راه‌اندازی: {channel_stats.get("bot_start_time", "نامشخص")}
-
-💾 مصرف حافظه: {memory_usage:.2f} MB
-🔋 مصرف CPU: {cpu_usage:.1f}%
-
-🖥️ سیستم عامل: {platform}
-🐍 نسخه پایتون: {python_version}
-
-📡 حالت سرور: {'فعال' if SERVER_MODE else 'غیرفعال'}
-🕒 ذخیره خودکار هر: {AUTO_SAVE_INTERVAL} ثانیه
-"""
-        await update.message.reply_text(status_text)
-    except Exception as e:
-        log_error(e, "خطا در دریافت وضعیت سرور")
-        await update.message.reply_text(f"خطا در دریافت وضعیت سرور: {str(e)}")
+    # دریافت وضعیت اتصال
+    connection_status = connection_manager.get_connection_status()
+    
+    # ایجاد پیام وضعیت سرور
+    server_status = server_monitor.format_status_message()
+    
+    # اضافه کردن وضعیت اتصال به پیام
+    connection_message = "\n🔌 وضعیت اتصال:\n"
+    connection_message += f"├ اتصال فعلی: {'✅ متصل' if connection_status['is_connected'] else '❌ قطع'}\n"
+    
+    if connection_status['last_connected']:
+        last_connected = datetime.fromtimestamp(connection_status['last_connected'])
+        connection_message += f"├ آخرین اتصال: {last_connected.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    
+    if connection_status['last_disconnect']:
+        last_disconnect = datetime.fromtimestamp(connection_status['last_disconnect'])
+        connection_message += f"├ آخرین قطعی: {last_disconnect.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    
+    connection_message += f"└ تعداد تلاش‌های اتصال مجدد: {connection_status['reconnect_attempts']}\n"
+    
+    # ترکیب پیام‌ها
+    complete_status = server_status + connection_message
+    
+    # ایجاد دکمه‌های مدیریتی
+    keyboard = [
+        [
+            InlineKeyboardButton("🔄 به‌روزرسانی", callback_data="refresh_status"),
+            InlineKeyboardButton("🔁 راه‌اندازی مجدد", callback_data="restart_bot")
+        ],
+        [InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")]
+    ]
+    
+    await update.message.reply_text(
+        complete_status,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستور /restart - راه‌اندازی مجدد ربات"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("این دستور فقط برای ادمین کانال در دسترس است.")
+    """دستور راه‌اندازی مجدد ربات"""
+    user = update.effective_user
+    
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔️ شما دسترسی به این بخش را ندارید.")
         return
     
-    await update.message.reply_text("در حال راه‌اندازی مجدد ربات...")
+    restart_message = await update.message.reply_text(
+        "🔄 در حال راه‌اندازی مجدد ربات...\n"
+        "⏳ لطفاً صبر کنید..."
+    )
     
-    # ذخیره آمار قبل از راه‌اندازی مجدد
-    save_stats()
+    # راه‌اندازی مجدد نرم‌افزاری
+    logger.info("راه‌اندازی مجدد ربات توسط ادمین درخواست شد")
     
-    # توقف تسک ذخیره خودکار
-    global save_task, is_running
-    is_running = False
-    if save_task:
-        save_task.cancel()
+    # ذخیره اطلاعات راه‌اندازی مجدد برای پیگیری بعد از راه‌اندازی
+    context.bot_data["restart_info"] = {
+        "chat_id": update.effective_chat.id,
+        "message_id": restart_message.message_id,
+        "time": time.time(),
+        "requested_by": user.id
+    }
     
-    # ارسال سیگنال برای راه‌اندازی مجدد
-    os.kill(os.getpid(), signal.SIGUSR1)
-
-def setup_signal_handlers():
-    """تنظیم مدیریت‌کننده‌های سیگنال"""
+    # قطع اتصال فعلی و راه‌اندازی مجدد
+    await connection_manager.shutdown()
     
-    def signal_handler(sig, frame):
-        """مدیریت سیگنال‌های دریافتی"""
-        if sig == signal.SIGINT or sig == signal.SIGTERM:
-            logger.info("سیگنال توقف دریافت شد. در حال خاتمه دادن به ربات...")
-            global is_running
-            is_running = False
-            
-            # ذخیره آمار قبل از خروج
-            save_stats()
-            
-            # خروج از برنامه
-            sys.exit(0)
-        
-        elif sig == signal.SIGUSR1:
-            logger.info("سیگنال راه‌اندازی مجدد دریافت شد. در حال راه‌اندازی مجدد ربات...")
-            
-            # ذخیره آمار قبل از راه‌اندازی مجدد
-            save_stats()
-            
-            # اجرای مجدد ربات
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-    
-    # ثبت مدیریت‌کننده‌های سیگنال
-    signal.signal(signal.SIGINT, signal_handler)  # کنترل+C
-    signal.signal(signal.SIGTERM, signal_handler)  # خاتمه توسط سیستم
-    
-    # اگر در لینوکس هستیم، سیگنال SIGUSR1 را هم ثبت کنیم
-    if sys.platform != 'win32':
-        signal.signal(signal.SIGUSR1, signal_handler)
-        
-    logger.info("مدیریت‌کننده‌های سیگنال با موفقیت تنظیم شدند")
+    # به دلیل ساختار حلقه در connection_manager، ربات به صورت خودکار دوباره راه‌اندازی می‌شود
+    # اما بهتر است اینجا هم یک پیام لاگ بگذاریم
+    logger.info("ربات به زودی دوباره راه‌اندازی خواهد شد...")
 
 def main():
-    """شروع و اجرای ربات"""
-    # تنظیم مدیریت‌کننده‌های سیگنال
-    if SERVER_MODE:
-        setup_signal_handlers()
+    setup_database()
     
-    # بارگیری آمار
-    load_stats()
-    
-    # ساخت ربات
-    application_builder = Application.builder().token(TOKEN)
-    
-    # اضافه کردن تنظیمات زمان انتظار برای درخواست‌های HTTP
-    application_builder = application_builder.http_version("1.1").get_updates_http_version("1.1")
-    application_builder = application_builder.connect_timeout(10.0).read_timeout(10.0)
-    application_builder = application_builder.connection_pool_size(8).pool_timeout(10.0)
-    application_builder = application_builder.write_timeout(10.0)
-    
-    # تعریف تابع برای به‌روزرسانی اطلاعات اعضا در زمان راه‌اندازی
-    async def update_members_after_startup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """این تابع پس از دریافت اولین پیام اجرا می‌شود و اطلاعات اعضا را به‌روز می‌کند"""
-        if hasattr(update_members_after_startup, "already_ran"):
-            return
-        
-        logger.info("به‌روزرسانی اطلاعات اعضای کانال...")
-        
-        try:
-            bot = context.bot
-            chat = await bot.get_chat(CHANNEL_ID)
-            member_count = await chat.get_member_count()
-            
-            channel_stats['member_count'] = member_count
-            logger.info(f"تعداد اعضای کانال به‌روز شد: {member_count}")
-            save_stats()
-            
-            # علامت‌گذاری تابع به عنوان اجرا شده
-            update_members_after_startup.already_ran = True
-            
-            # راه‌اندازی بررسی خودکار حساب‌های حذف شده پس از به‌روزرسانی اولیه
-            await auto_clean_deleted_accounts(context)
-            
-            # تنظیم زمان‌بندی برای بررسی منظم حساب‌های حذف شده (هر 6 ساعت یکبار)
-            try:
-                if hasattr(context, 'job_queue') and context.job_queue:
-                    context.job_queue.run_repeating(auto_clean_deleted_accounts, interval=21600, first=21600)
-                    logger.info("زمان‌بندی بررسی خودکار حساب‌های حذف شده با موفقیت تنظیم شد")
-            except Exception as e:
-                log_error(e, "خطا در تنظیم زمان‌بندی بررسی خودکار")
-                
-        except Exception as e:
-            log_error(e, "خطا در به‌روزرسانی اولیه تعداد اعضا")
-    
-    # ساخت و پیکربندی برنامه
-    application = application_builder.build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("refresh_stats", refresh_stats_command))
-    application.add_handler(CommandHandler("users", users_command))
-    application.add_handler(CommandHandler("remove_deleted", remove_deleted_accounts))
-    application.add_handler(CommandHandler("server", server_status_command))
-    application.add_handler(CommandHandler("restart", restart_command))
-    
-    # هندلر برای پیگیری تغییرات اعضای کانال
-    application.add_handler(ChatMemberHandler(track_chat_member, ChatMemberHandler.CHAT_MEMBER))
-    
-    # افزودن هندلر برای به‌روزرسانی اطلاعات اعضا پس از راه‌اندازی - اولویت بالا
-    application.add_handler(CommandHandler("start", update_members_after_startup), group=0)
-    application.add_handler(CommandHandler("help", update_members_after_startup), group=0)
-    application.add_handler(CommandHandler("stats", update_members_after_startup), group=0)
-    application.add_handler(CommandHandler("users", update_members_after_startup), group=0)
-    application.add_handler(CommandHandler("remove_deleted", update_members_after_startup), group=0)
-    application.add_handler(CommandHandler("server", update_members_after_startup), group=0)
-    
-    # افزودن هندلر خطا
-    application.add_error_handler(error_handler)
-    
-    # شروع تسک ذخیره خودکار آمار
-    global save_task
-    
-    # راه‌اندازی ربات با مدیریت اتصال مجدد پیشرفته
-    reconnect_delay = 1  # تاخیر اولیه یک ثانیه
-    while True:
-        try:
-            logger.info("در حال راه‌اندازی ربات...")
-            
-            if SERVER_MODE:
-                # در حالت سرور، تسک ذخیره خودکار آمار را راه‌اندازی می‌کنیم
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                async def start_polling_with_auto_save():
-                    global save_task
-                    # تسک ذخیره خودکار را راه‌اندازی می‌کنیم
-                    save_task = asyncio.create_task(auto_save_stats())
-                    
-                    # شروع پولینگ
-                    await application.initialize()
-                    await application.start()
-                    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, timeout=10)
-                    
-                    # منتظر ماندن برای سیگنال توقف
-                    stop_signal = asyncio.Future()
-                    
-                    # تعریف تابع برای توقف
-                    def stop_callback():
-                        stop_signal.set_result(None)
-                    
-                    # منتظر ماندن برای سیگنال توقف
-                    await stop_signal
-                    
-                    # توقف و آزادسازی منابع
-                    await application.updater.stop()
-                    await application.stop()
-                    await application.shutdown()
-                
-                # اجرای تابع با حلقه رویداد جدید
-                try:
-                    loop.run_until_complete(start_polling_with_auto_save())
-                finally:
-                    loop.close()
-            else:
-                # در حالت عادی، فقط پولینگ را اجرا می‌کنیم
-                application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True, timeout=10)
-            
-            # اگر به اینجا برسیم، پولینگ با موفقیت پایان یافته است
-            logger.info("ربات با موفقیت متوقف شد")
-            break
-            
-        except KeyboardInterrupt:
-            # توقف توسط کاربر - خروج بدون اتصال مجدد
-            logger.info("ربات توسط کاربر متوقف شد")
-            if SERVER_MODE:
-                # در حالت سرور، سیگنال توقف را مدیریت می‌کنیم
-                os.kill(os.getpid(), signal.SIGTERM)
-            break
-            
-        except Exception as e:
-            # خطا در اتصال - تلاش مجدد
-            log_error(e, "خطا در راه‌اندازی ربات")
-            
-            # محاسبه تاخیر بین تلاش‌های اتصال مجدد با الگوریتم عقب‌نشینی نمایی
-            reconnect_delay = min(reconnect_delay * 1.5, MAX_RECONNECT_DELAY)
-            logger.info(f"تلاش مجدد برای راه‌اندازی پس از {reconnect_delay:.1f} ثانیه...")
-            
-            # ذخیره آمار قبل از تلاش مجدد
-            save_stats()
-            
-            # انتظار قبل از تلاش مجدد
-            time.sleep(reconnect_delay)
-            
-            # افزایش شمارنده راه‌اندازی مجدد
-            channel_stats["restart_count"] += 1
+    # راه‌اندازی ربات با استفاده از ConnectionManager
+    asyncio.run(run_bot())
 
-if __name__ == "__main__":
+async def setup_handlers(application: Application):
+    """تنظیم هندلرهای ربات"""
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
+    
+    application.add_handler(CommandHandler("admin", admin_panel))
+    application.add_handler(CommandHandler("add_channel", add_channel_command))
+    application.add_handler(CommandHandler("del_channel", del_channel_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo))
+    application.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video))
+    application.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_document))
+    application.add_handler(MessageHandler(filters.AUDIO & ~filters.COMMAND, handle_audio))
+    
+    application.add_handler(CommandHandler("d", download_command))
+    
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("restart", restart_command))
+
+async def post_startup():
+    """عملیات پس از راه‌اندازی ربات"""
+    logger.info("ربات با موفقیت راه‌اندازی شد!")
+    
+    # بررسی اطلاعات راه‌اندازی مجدد
+    application = connection_manager.application
+    if application and hasattr(application, "bot_data") and "restart_info" in application.bot_data:
+        restart_info = application.bot_data["restart_info"]
+        try:
+            restart_time = datetime.fromtimestamp(restart_info["time"])
+            now = datetime.now()
+            restart_duration = (now - restart_time).total_seconds()
+            
+            await application.bot.edit_message_text(
+                f"✅ ربات با موفقیت راه‌اندازی مجدد شد.\n"
+                f"⏱ زمان راه‌اندازی: {restart_duration:.2f} ثانیه",
+                chat_id=restart_info["chat_id"],
+                message_id=restart_info["message_id"]
+            )
+            
+            # پاک کردن اطلاعات راه‌اندازی مجدد
+            del application.bot_data["restart_info"]
+            
+        except Exception as e:
+            logger.error(f"خطا در ارسال پیام راه‌اندازی مجدد: {str(e)}")
+
+async def run_bot():
+    """راه‌اندازی ربات با قابلیت اتصال مجدد خودکار"""
+    logger.info("در حال راه‌اندازی ربات...")
+    
+    # راه‌اندازی ربات با استفاده از ConnectionManager
+    await connection_manager.start_polling(
+        setup_handlers_func=setup_handlers,
+        post_startup_func=post_startup
+    )
+
+if __name__ == '__main__':
     main()
