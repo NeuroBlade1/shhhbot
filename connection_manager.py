@@ -79,22 +79,24 @@ class ConnectionManager:
                 self.connection_status["last_connected"] = time.time()
                 self.reconnect_attempts = 0
                 
-                # شروع polling - در نسخه‌های جدید python-telegram-bot
-                # روش راه‌اندازی فرق کرده است
-                await self.application.initialize()
-                await self.application.start()
-                await self.application.update_queue.put_nowait(object())  # برای اطمینان از باز شدن کانال ارتباطی
+                # استفاده از الگوی async with برای مدیریت چرخه حیات Application
+                # این روش برای نسخه‌های جدید python-telegram-bot توصیه شده است
+                async with self.application:
+                    # اگر تابع پس از راه‌اندازی وجود دارد، اجرا می‌کنیم
+                    if post_startup_func:
+                        await post_startup_func()
+                    
+                    logger.info("ربات با موفقیت راه‌اندازی شد!")
+                    
+                    # شروع polling با استفاده از حالت پیش‌فرض
+                    await self.application.start_polling(drop_pending_updates=True)
+                    
+                    # منتظر می‌مانیم تا Application متوقف شود
+                    await self.application.idle()
                 
-                if post_startup_func:
-                    await post_startup_func()
-                
-                logger.info("ربات با موفقیت راه‌اندازی شد!")
-                
-                # در نسخه‌های جدید به جای استفاده از updater
-                # باید از خود application استفاده کنیم
-                await self.application.run_polling(drop_pending_updates=True)
-                
-                break  # اگر polling به پایان برسد، از حلقه خارج می‌شویم
+                # اگر به اینجا برسیم یعنی برنامه به طور عادی متوقف شده است
+                # از حلقه خارج می‌شویم
+                break
                 
             except telegram.error.NetworkError as e:
                 await self.handle_connection_error(e, "خطای شبکه")
