@@ -493,7 +493,7 @@ async def handle_instagram_story(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         print(f"Error downloading story: {str(e)}")
         keyboard = []
-        if is_admin(user.id):
+        if is_admin(user_id):
             keyboard.append([InlineKeyboardButton("🔙 بازگشت به پنل", callback_data="admin_panel")])
         
         error_message = (
@@ -1364,24 +1364,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "restart_bot" and is_admin(user_id):
         restart_message = await query.edit_message_text(
             "🔄 در حال راه‌اندازی مجدد ربات...\n"
-            "⏳ لطفاً صبر کنید...",
-            reply_markup=None
+            "⏳ لطفاً صبر کنید...\n\n"
+            "❗️ توجه: در سرویس Railway این عملیات به صورت دوباره‌سازی کامل کانتینر انجام می‌شود و ممکن است کمی طول بکشد."
         )
         
-        logger.info(f"راه‌اندازی مجدد ربات توسط ادمین {user_id} درخواست شد")
+        # راه‌اندازی مجدد نرم‌افزاری
+        logger.info("راه‌اندازی مجدد ربات توسط ادمین درخواست شد")
         
-        # ذخیره اطلاعات راه‌اندازی مجدد برای پیگیری بعد از راه‌اندازی
-        context.bot_data["restart_info"] = {
-            "chat_id": query.message.chat_id,
-            "message_id": query.message.message_id,
-            "time": time.time(),
-            "requested_by": user_id
-        }
+        # به دلیل اینکه در Railway مجدداً کانتینر ساخته می‌شود
+        # نیازی به اقدام خاصی نیست - کاربر باید از طریق پنل Railway
+        # کانتینر را مجدداً راه‌اندازی کند
         
-        # قطع اتصال فعلی و راه‌اندازی مجدد
-        await connection_manager.shutdown()
-        
-        logger.info("ربات به زودی دوباره راه‌اندازی خواهد شد...")
+        logger.info("کاربر باید از طریق پنل Railway، کانتینر را مجدداً راه‌اندازی کند.")
 
 async def check_user_ban(user_id: int) -> bool:
     conn = sqlite3.connect('bot_database.db')
@@ -1478,37 +1472,27 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     restart_message = await update.message.reply_text(
         "🔄 در حال راه‌اندازی مجدد ربات...\n"
-        "⏳ لطفاً صبر کنید..."
+        "⏳ لطفاً صبر کنید...\n\n"
+        "❗️ توجه: در سرویس Railway این عملیات به صورت دوباره‌سازی کامل کانتینر انجام می‌شود و ممکن است کمی طول بکشد."
     )
     
     # راه‌اندازی مجدد نرم‌افزاری
     logger.info("راه‌اندازی مجدد ربات توسط ادمین درخواست شد")
     
-    # ذخیره اطلاعات راه‌اندازی مجدد برای پیگیری بعد از راه‌اندازی
-    context.bot_data["restart_info"] = {
-        "chat_id": update.effective_chat.id,
-        "message_id": restart_message.message_id,
-        "time": time.time(),
-        "requested_by": user.id
-    }
+    # به دلیل اینکه در Railway مجدداً کانتینر ساخته می‌شود
+    # نیازی به اقدام خاصی نیست - کاربر باید از طریق پنل Railway
+    # کانتینر را مجدداً راه‌اندازی کند
     
-    # قطع اتصال فعلی و راه‌اندازی مجدد
-    await connection_manager.shutdown()
-    
-    # به دلیل ساختار حلقه در connection_manager، ربات به صورت خودکار دوباره راه‌اندازی می‌شود
-    # اما بهتر است اینجا هم یک پیام لاگ بگذاریم
-    logger.info("ربات به زودی دوباره راه‌اندازی خواهد شد...")
+    logger.info("کاربر باید از طریق پنل Railway، کانتینر را مجدداً راه‌اندازی کند.")
 
 def main():
     setup_database()
     
-    # راه‌اندازی ربات با استفاده از ConnectionManager
-    asyncio.run(run_bot())
-
-async def setup_handlers(application: Application):
-    """تنظیم هندلرهای ربات"""
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
+    # ساخت و پیکربندی application
+    application = Application.builder().token(TOKEN).build()
     
+    # تنظیم هندلرها
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_chat_members))
     application.add_handler(CommandHandler("admin", admin_panel))
     application.add_handler(CommandHandler("add_channel", add_channel_command))
     application.add_handler(CommandHandler("del_channel", del_channel_command))
@@ -1517,55 +1501,24 @@ async def setup_handlers(application: Application):
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(CallbackQueryHandler(button_callback))
-    
     application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo))
     application.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND, handle_video))
     application.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_document))
     application.add_handler(MessageHandler(filters.AUDIO & ~filters.COMMAND, handle_audio))
-    
     application.add_handler(CommandHandler("d", download_command))
-    
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("restart", restart_command))
-
-async def post_startup():
-    """عملیات پس از راه‌اندازی ربات"""
-    logger.info("ربات با موفقیت راه‌اندازی شد!")
     
-    # بررسی اطلاعات راه‌اندازی مجدد
-    application = connection_manager.application
-    if application and hasattr(application, "bot_data") and "restart_info" in application.bot_data:
-        restart_info = application.bot_data["restart_info"]
-        try:
-            restart_time = datetime.fromtimestamp(restart_info["time"])
-            now = datetime.now()
-            restart_duration = (now - restart_time).total_seconds()
-            
-            await application.bot.edit_message_text(
-                f"✅ ربات با موفقیت راه‌اندازی مجدد شد.\n"
-                f"⏱ زمان راه‌اندازی: {restart_duration:.2f} ثانیه",
-                chat_id=restart_info["chat_id"],
-                message_id=restart_info["message_id"]
-            )
-            
-            # پاک کردن اطلاعات راه‌اندازی مجدد
-            del application.bot_data["restart_info"]
-            
-        except Exception as e:
-            logger.error(f"خطا در ارسال پیام راه‌اندازی مجدد: {str(e)}")
+    # ذخیره application در connection_manager برای دسترسی از طریق سایر بخش‌ها
+    connection_manager.application = application
 
-async def run_bot():
-    """راه‌اندازی ربات"""
-    logger.info("در حال راه‌اندازی ربات...")
+    # لاگ شروع ربات
+    logger.info("ربات در حال راه‌اندازی...")
     
-    # راه‌اندازی ساده ربات
-    try:
-        await connection_manager.start_polling(
-            setup_handlers_func=setup_handlers,
-            post_startup_func=post_startup
-        )
-    except Exception as e:
-        logger.error(f"خطا در راه‌اندازی ربات: {str(e)}")
+    # راه‌اندازی ربات
+    application.run_polling(drop_pending_updates=True)
+    
+    logger.info("ربات متوقف شد.")
 
 if __name__ == '__main__':
     main()
